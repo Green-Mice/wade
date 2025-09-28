@@ -5,6 +5,12 @@ start() ->
     wade_app:start(),
     wade:route(get, "/hello/[name]", fun(Req) ->
         Name = wade:param(Req, name),
+        io:format("~p~p~n", [Req, Name]),
+        {200, "\{\"message\":\"Hello " ++ Name ++ "!\"}", [{"Content-Type", "application/json"}]}
+    end, []),
+    wade:route(get, "/hello", fun(Req) ->
+        Name = wade:param(Req, name),
+        io:format("~p~p~n", [Req, Name]),
         {200, "\{\"message\":\"Hello " ++ Name ++ "!\"}", [{"Content-Type", "application/json"}]}
     end, []),
     wade:route(get, "/api/users", fun(_Req) ->

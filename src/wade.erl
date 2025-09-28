@@ -41,12 +41,22 @@ route(Method, Path, Handler, RequiredParams, RequiredHeaders) ->
     gen_server:call(?MODULE, {add_route, Method, Path, Handler, RequiredParams, RequiredHeaders}).
 
 %% Helper functions
-param(#req{params = Params}, Key) -> proplists:get_value(Key, Params).
 query(#req{query = Query}, Key) -> proplists:get_value(Key, Query).
 query(#req{query = Query}, Key, Default) -> proplists:get_value(Key, Query, Default).
 body(#req{body = Body}, Key) -> proplists:get_value(Key, Body).
 body(#req{body = Body}, Key, Default) -> proplists:get_value(Key, Body, Default).
 method(#req{method = Method}) -> Method.
+
+param(#req{params = Params, query = Query}, Key) ->
+    KeyAtom = case Key of
+        KeyA when is_atom(KeyA) -> KeyA;
+        KeyS when is_list(KeyS) -> list_to_atom(KeyS)
+    end,
+    
+    case proplists:get_value(KeyAtom, Params) of
+        undefined -> proplists:get_value(KeyAtom, Query);
+        Value -> Value
+    end.
 
 %% =============================================================================
 %% gen_server callbacks
