@@ -15,6 +15,7 @@
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
+-export([parse_query/1, parse_body/1]).
 %% inets callback
 -export([do/1]).
 
