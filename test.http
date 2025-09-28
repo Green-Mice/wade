@@ -1,0 +1,7 @@
+POST http://localhost:8080/api/users
+Content-Type: application/x-www-form-urlencoded
+Accept: application/json
+
+name=toto
+
+
