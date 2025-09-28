@@ -140,7 +140,7 @@ do(ModData) ->
         body = parse_body(ModData),
         headers = ModData#mod.parsed_header
     },
-    
+
     Routes = gen_server:call(?MODULE, {get_routes}),
     case match_route(Routes, Req) of
         {ok, Handler, PathParams} ->
@@ -276,21 +276,28 @@ match_pattern(_, _, _) -> no_match.
 parse_query("") -> [];
 parse_query(Query) ->
     [case string:split(Pair, "=", leading) of
-         [K] -> {url_decode(K), ""};
-         [K, V] -> {url_decode(K), url_decode(V)}
+         [K] -> {list_to_atom(url_decode(K)), ""};
+         [K, V] -> {list_to_atom(url_decode(K)), url_decode(V)}
      end || Pair <- string:split(Query, "&", all)].
 
 parse_body(ModData) ->
     Method = string:to_upper(ModData#mod.method),
     HasBody = lists:member(Method, ["POST", "PUT", "PATCH"]),
+
     case HasBody of
         true ->
-            ContentType = proplists:get_value("content-type", ModData#mod.parsed_header, ""),
+            Headers = element(12, ModData), 
+            ContentType = proplists:get_value("content-type", Headers, ""),
+
             case string:find(ContentType, "application/x-www-form-urlencoded") of
-                nomatch -> [];
-                _ -> parse_query(ModData#mod.entity_body)
+                nomatch ->
+                    [];
+                _ ->
+                    EntityBody = element(13, ModData),
+                    parse_query(EntityBody)
             end;
-        false -> []
+        false ->
+            []
     end.
 
 url_decode(Str) -> url_decode(Str, []).

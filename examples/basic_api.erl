@@ -12,7 +12,5 @@ start() ->
     end, []),
     wade:route(post, "/api/users", fun(Req) ->
         Name = wade:body(Req, name),
-        {200, [
-            "{\"message\": \"User "++ Name++ " created\"}"
-        ], [{"Content-Type", "application/json"}]}
-    end, [name]).
+        {200, "\{\"message\":\"Hello " ++ Name ++ "!\"}", [{"Content-Type", "application/json"}]}
+    end, []).
