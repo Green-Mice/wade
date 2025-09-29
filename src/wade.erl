@@ -10,7 +10,8 @@
 -export([
     start_link/1, start_link/2, stop/0,
     route/4, route/5,
-    param/2, query/2, query/3, body/2, body/3, method/1
+    param/2, query/2, query/3, body/2, body/3, method/1,
+    request/4
 ]).
 
 %% gen_server callbacks
@@ -335,4 +336,28 @@ status_text(Code) -> integer_to_list(Code).
 
 merge_headers(Defaults, Custom) ->
     lists:foldl(fun({K, V}, Acc) -> lists:keystore(K, 1, Acc, {K, V}) end, Defaults, Custom).
+
+%% Client HTTP (GET, POST, PUT, PATCH, DELETE)
+request(Method, URL, Headers, Body) ->
+    application:ensure_all_started(inets),
+    Verb =
+        case Method of
+            get -> get;
+            post -> post;
+            put -> put;
+            patch -> patch;
+            delete -> delete;
+            _ -> get
+        end,
+    ContentType = case lists:keyfind("content-type", 1, Headers) of
+        {_, CType} -> CType;
+        false -> "application/json"
+    end,
+    Hdrs = [{list_to_binary(K), V} || {K, V} <- Headers],
+    case Verb of
+        get -> 
+            httpc:request(get, {URL, Hdrs}, [], []);
+        _ ->
+            httpc:request(Verb, {URL, Hdrs, ContentType, Body}, [], [])
+    end.
 
