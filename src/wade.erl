@@ -104,20 +104,27 @@ handle_cast(_Msg, State) ->
 
 handle_info({'EXIT', Pid, Reason}, #state{httpd_pid = Pid} = State) ->
     io:format("HTTP server crashed (~p), restarting...~n", [Reason]),
-    case inets:start(httpd, [
-        {port, State#state.port},
-        {server_name, "wade"},
-        {server_root, "."},
-        {document_root, "."},
-        {modules, [?MODULE]}
-    ]) of
-        {ok, NewPid} ->
-            link(NewPid),
-            io:format("HTTP server restarted (PID: ~p)~n", [NewPid]),
-            {noreply, State#state{httpd_pid = NewPid}};
-        {error, Reason2} ->
-            io:format("Failed to restart HTTP server: ~p~n", [Reason2]),
-            {stop, Reason2, State}
+    try
+        case inets:start(httpd, [
+                 {port, State#state.port},
+                 {server_name, "wade"},
+                 {server_root, "."},
+                 {document_root, "."},
+                 {modules, [?MODULE]}
+             ]) of
+            {ok, NewPid} ->
+                link(NewPid),
+                io:format("HTTP server restarted (PID: ~p)~n", [NewPid]),
+                {noreply, State#state{httpd_pid = NewPid}};
+            {error, Reason2} ->
+                io:format("Failed to restart HTTP server: ~p~n", [Reason2]),
+                {stop, Reason2, State}
+        end
+    catch
+        Class:Error ->
+            io:format("Exception during restart: ~p:~p~n", [Class, Error]),
+            % Optionally stop or continue with same state
+            {stop, Error, State}
     end;
 
 handle_info({tcp, Socket, Data}, State) ->
@@ -125,7 +132,7 @@ handle_info({tcp, Socket, Data}, State) ->
     gen_tcp:close(Socket),
     {noreply, State};
 
-handle_info(_Info, State) ->
+handle_info(_Other, State) ->
     {noreply, State}.
 
 terminate(_Reason, #state{httpd_pid = HttpdPid}) ->
