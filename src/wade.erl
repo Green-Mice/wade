@@ -342,7 +342,8 @@ is_supported_content_type(ContentType) ->
         "application/json",
         "application/xml",
         "text/xml",
-        "text/plain"
+        "text/plain",
+        "text/html"
     ],
     lists:any(fun(Type) -> 
         string:find(ContentType, Type) =/= nomatch 
