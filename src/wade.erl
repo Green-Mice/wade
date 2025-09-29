@@ -15,7 +15,7 @@
 ]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3, send_response/2]).
 
 -export([parse_query/1, parse_body/1, url_decode/2, parse_pattern/1, match_pattern/3]).
 
@@ -154,8 +154,7 @@ do(ModData) ->
     end,
 
     {Path, QueryString} = split_uri(ModData#mod.request_uri),
-
-    Body = parse_body(ModData),  % Parses body as earlier
+    Body = parse_body(ModData),
 
     Req = #req{
         method = Method,
@@ -170,11 +169,11 @@ do(ModData) ->
     case match_route(Routes, Req) of
         {ok, Handler, PathParams} ->
             ReqWithParams = Req#req{params = PathParams},
-            handle_request_safe(Handler, ReqWithParams, ModData),
-            {proceed, ModData#mod.data};
+            Response = handle_request_safe(Handler, ReqWithParams, ModData),
+            send_response(Response, ModData),  % <-- send full HTTP response here
+            {stop, normal, ModData#mod.data};
         not_found ->
-            %% Send 404 not found and close socket or manage keep-alive
-            send_response(404, "Not Found", [], ModData),
+            send_response({404, "Not Found"}, ModData),  
             {stop, normal, ModData#mod.data}
     end.
 
@@ -384,9 +383,47 @@ url_decode([$%, H1, H2 | Rest], Acc) ->
 url_decode([$+ | Rest], Acc) -> url_decode(Rest, [32 | Acc]);
 url_decode([C | Rest], Acc) -> url_decode(Rest, [C | Acc]).
 
-status_text(200) -> "OK"; status_text(201) -> "Created";
-status_text(400) -> "Bad Request"; status_text(404) -> "Not Found";
-status_text(500) -> "Internal Server Error"; status_text(504) -> "Gateway Timeout";
+%% Sends an HTTP response over the socket stored in ModData#mod.conn
+send_response({StatusCode, Body}, ModData) ->
+    % Build the HTTP status line: e.g. "HTTP/1.1 200 OK\r\n"
+    StatusLine = io_lib:format("HTTP/1.1 ~p ~s\r\n",
+                               [StatusCode, status_text(StatusCode)]),
+
+    % Convert body to binary if it's a list (string)
+    BodyBin = case is_list(Body) of
+                  true -> list_to_binary(Body);
+                  false -> Body
+              end,
+
+    ContentLength = byte_size(BodyBin),
+
+    % Prepare HTTP response headers
+    Headers = [
+        {"content-length", integer_to_list(ContentLength)},
+        {"content-type", "application/json"},  % Adjust content-type as appropriate
+        {"connection", "close"}
+    ],
+
+    % Serialize headers to HTTP header lines
+    HeaderLines = lists:map(fun({Key, Value}) ->
+                                io_lib:format("~s: ~s\r\n", [Key, Value])
+                            end, Headers),
+
+    % Compose full HTTP response iolist: status line, headers, blank line, body
+    ResponseIolist = [StatusLine, HeaderLines, "\r\n", BodyBin],
+
+    % Send the serialized response over TCP socket
+    gen_tcp:send(ModData#mod.connection, ResponseIolist).
+
+%% Maps HTTP status codes to reason phrases
+status_text(200) -> "OK";
+status_text(201) -> "Created";
+status_text(400) -> "Bad Request";
+status_text(404) -> "Not Found";
+status_text(405) -> "Method Not Allowed";
+status_text(500) -> "Internal Server Error";
+status_text(501) -> "Not Implemented";
+status_text(504) -> "Gateway Timeout";
 status_text(Code) -> integer_to_list(Code).
 
 merge_headers(Defaults, Custom) ->
