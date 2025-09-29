@@ -135,33 +135,47 @@ code_change(_OldVsn, State, _Extra) ->
 %% =============================================================================
 %% HTTP request handling (inets callback)
 %% =============================================================================
-
 do(ModData) ->
-    Method = case string:to_lower(ModData#mod.method) of
-        "get" -> get; "post" -> post; "put" -> put; "delete" -> delete;
-        "patch" -> patch; "head" -> head; "options" -> options;
-        Other -> list_to_atom(Other)
+    MethodString = string:to_lower(ModData#mod.method),
+    io:format("Wade: Received method ~p on URI ~p~n", [MethodString, ModData#mod.request_uri]),
+    Method = case MethodString of
+        "get" -> get;
+        "post" -> 
+            io:format("Wade: Detected POST method~n"),
+            post;
+        "put" -> put;
+        "delete" -> delete;
+        "patch" -> patch;
+        "head" -> head;
+        "options" -> options;
+        Other -> 
+            io:format("Wade: Unknown method ~p, converting to atom~n", [Other]),
+            list_to_atom(Other)
     end,
-    
+
     {Path, QueryString} = split_uri(ModData#mod.request_uri),
-    
+
+    Body = parse_body(ModData),
+    io:format("Wade: Parsed body: ~p~n", [Body]),
+
     Req = #req{
         method = Method,
         path = Path,
         query = parse_query(QueryString),
-        body = parse_body(ModData),
+        body = Body,
         headers = ModData#mod.parsed_header
     },
 
     Routes = gen_server:call(?MODULE, {get_routes}),
     case match_route(Routes, Req) of
         {ok, Handler, PathParams} ->
+            io:format("Wade: Route matched, calling handler~n", []),
             ReqWithParams = Req#req{params = PathParams},
             handle_request_safe(Handler, ReqWithParams, ModData);
         not_found ->
+            io:format("Wade: No matching route found for path ~p~n", [Path]),
             send_response(404, "Not Found", [], ModData)
     end,
-    
     {proceed, ModData#mod.data}.
 
 %% Safe request handling with process isolation
@@ -292,62 +306,75 @@ parse_query(Query) ->
          [K, V] -> {list_to_atom(url_decode(K)), url_decode(V)}
      end || Pair <- string:split(Query, "&", all)].
 
-parse_body(ModData) when is_tuple(ModData) ->
-    % Extract fields safely - works with both real #mod and test tuples
-    Method = case catch ModData#mod.method of
-        {'EXIT', _} -> element(2, ModData);  % Test tuple fallback
-        M -> M
-    end,
-
-    Headers = case catch ModData#mod.parsed_header of
-        {'EXIT', _} -> element(4, ModData);  % Test tuple fallback
-        H -> H
-    end,
-
-    EntityBody = case catch ModData#mod.entity_body of
-        {'EXIT', _} -> element(5, ModData);  % Test tuple fallback
-        E -> E
-    end,
-
-    MethodUpper = string:to_upper(Method),
-    HasBody = lists:member(MethodUpper, ["POST", "PUT", "PATCH"]),
-
-    case HasBody of
-        true ->
-            ContentType = proplists:get_value("content-type", Headers, ""),
-            case ContentType of
-                "" ->
-                    % No content-type specified, return empty
-                    [];
-                _ ->
-                    case string:find(ContentType, "application/x-www-form-urlencoded") of
-                        nomatch -> 
-                            % Check if it's a known content type we want to handle
-                            case is_supported_content_type(ContentType) of
-                                true -> EntityBody;  % Return raw body for JSON, XML, etc.
-                                false -> []          % Unknown content type, return empty
-                            end;
-                        _ -> 
-                            % Form-encoded, parse as key-value pairs
-                            parse_query(EntityBody)
-                    end
-            end;
-        false ->
-            []
-    end.
-
-%% Helper to check if content type should be passed through
+%% Helper to check content type inline without calling a separate function
 is_supported_content_type(ContentType) ->
-    SupportedTypes = [
+    SupportedContentTypes = [
         "application/json",
-        "application/xml",
-        "text/xml",
+        "application/x-www-form-urlencoded",
         "text/plain",
         "text/html"
     ],
-    lists:any(fun(Type) -> 
-        string:find(ContentType, Type) =/= nomatch 
-    end, SupportedTypes).
+    lists:any(fun(Type) -> string:find(ContentType, Type) =/= nomatch end, SupportedContentTypes).
+
+binary_to_string(Binary) when is_binary(Binary) ->
+    binary:bin_to_list(Binary);
+binary_to_string(Other) ->
+    Other.
+
+parse_body(ModData) when is_tuple(ModData) ->
+    case ModData of
+        #mod{method=Method, parsed_header=Headers, entity_body=Body} ->
+            io:format("Wade: Parsing body for method ~p~n", [Method]),
+            MethodUpper = string:to_upper(Method),
+            IsBodyMethod = MethodUpper == "POST" orelse MethodUpper == "PUT" orelse MethodUpper == "PATCH",
+            if
+                IsBodyMethod ->
+                    ContentType = proplists:get_value("content-type", Headers, ""),
+                    io:format("Wade: Content-Type is ~p~n", [ContentType]),
+                    case is_supported_content_type(ContentType) of
+                        true ->
+                            case string:find(ContentType, "application/x-www-form-urlencoded") of
+                                nomatch ->
+                                    binary_to_string(Body);
+                                _ ->
+                                    parse_query(binary_to_string(Body))
+                            end;
+                        false ->
+                            io:format("Wade: Unsupported content-type: ~p, returning empty body~n", [ContentType]),
+                            []
+                    end;
+                true ->
+                    io:format("Wade: No body for method ~p~n", [Method]),
+                    []
+            end;
+        {mod, Method, _RequestURI, Headers, Body, _O1, _O2} ->
+            io:format("Wade: Parsing body with raw tuple, method ~p~n", [Method]),
+            MethodUpper = string:to_upper(Method),
+            IsBodyMethod = MethodUpper == "POST" orelse MethodUpper == "PUT" orelse MethodUpper == "PATCH",
+            if
+                IsBodyMethod ->
+                    ContentType = proplists:get_value("content-type", Headers, ""),
+                    io:format("Wade: Content-Type is ~p~n", [ContentType]),
+                    case is_supported_content_type(ContentType) of
+                        true ->
+                            case string:find(ContentType, "application/x-www-form-urlencoded") of
+                                nomatch ->
+                                    binary_to_string(Body);
+                                _ ->
+                                    parse_query(binary_to_string(Body))
+                            end;
+                        false ->
+                            io:format("Wade: Unsupported content-type: ~p (test tuple), returning empty body~n", [ContentType]),
+                            []
+                    end;
+                true ->
+                    io:format("Wade: No body for method ~p (test tuple)~n", [Method]),
+                    []
+            end;
+        _ ->
+            io:format("Wade: parse_body called with unexpected argument: ~p~n", [ModData]),
+            []
+    end.
 
 url_decode(Str) -> url_decode(Str, []).
 url_decode([], Acc) -> lists:reverse(Acc);
