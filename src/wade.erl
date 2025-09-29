@@ -22,6 +22,8 @@
 %% inets callback
 -export([do/1]).
 
+-export([upgrade_to_websocket/1, websocket_loop/2, send_ws/2, close_ws/1]).
+
 %% =============================================================================
 %% API
 %% =============================================================================
@@ -360,4 +362,89 @@ request(Method, URL, Headers, Body) ->
         _ ->
             httpc:request(Verb, {URL, Hdrs, ContentType, Body}, [], [])
     end.
+
+%% =============================================================================
+%% WebSocket Support
+%% =============================================================================
+
+%% Perform the WebSocket handshake and switch protocol
+upgrade_to_websocket(ModData) ->
+    Headers = ModData#mod.parsed_header,
+    case proplists:get_value("sec-websocket-key", Headers) of
+        undefined ->
+            gen_tcp:send(ModData#mod.socket,
+                "HTTP/1.1 400 Bad Request\r\n\r\nMissing Sec-WebSocket-Key");
+        Key ->
+            Accept = base64:encode(crypto:hash(sha,
+                Key ++ "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")),
+            Response =
+                "HTTP/1.1 101 Switching Protocols\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Accept: " ++ Accept ++ "\r\n\r\n",
+            gen_tcp:send(ModData#mod.socket, Response),
+            {ok, ModData#mod.socket}
+    end.
+
+%% Main loop – handles incoming websocket frames
+websocket_loop(Socket, HandlerFun) ->
+    inet:setopts(Socket, [{active, once}]),
+    receive
+        {tcp, Socket, Data} ->
+            case parse_ws_frame(Data) of
+                {text, Msg} ->
+                    HandlerFun({text, Msg}),
+                    websocket_loop(Socket, HandlerFun);
+                {close, _} ->
+                    close_ws(Socket);
+                {ping, Msg} ->
+                    send_ws(Socket, {pong, Msg}),
+                    websocket_loop(Socket, HandlerFun);
+                _ ->
+                    websocket_loop(Socket, HandlerFun)
+            end;
+        {tcp_closed, Socket} ->
+            ok
+    end.
+
+%% Send WebSocket frames
+send_ws(Socket, {text, Msg}) ->
+    Frame = build_ws_frame(1, list_to_binary(Msg)),
+    gen_tcp:send(Socket, Frame);
+send_ws(Socket, {pong, Msg}) ->
+    Frame = build_ws_frame(10, Msg),
+    gen_tcp:send(Socket, Frame).
+
+close_ws(Socket) ->
+    Frame = build_ws_frame(8, <<>>),
+    gen_tcp:send(Socket, Frame),
+    gen_tcp:close(Socket).
+
+%% -----------------------------------------------------------------------------
+%% Internal frame helpers
+%% -----------------------------------------------------------------------------
+
+%% Very basic WebSocket frame parser – supports single-frame text
+parse_ws_frame(<<129, Len, Rest/binary>>) when Len =< 125 ->
+    <<Msg:Len/binary, _/binary>> = Rest,
+    {text, binary_to_list(Msg)};
+parse_ws_frame(<<136, _, _/binary>>) ->
+    {close, <<>>};
+parse_ws_frame(<<137, Len, Msg:Len/binary>>) ->
+    {ping, Msg};
+parse_ws_frame(<<138, Len, Msg:Len/binary>>) ->
+    {pong, Msg};
+parse_ws_frame(_) ->
+    {unknown, <<>>}.
+
+
+%% Build a simple, unmasked WebSocket frame for text, close, and pong opcodes
+build_ws_frame(1, Payload) when is_binary(Payload) ->
+    Len = byte_size(Payload),
+    <<129, Len, Payload/binary>>;
+build_ws_frame(8, _) ->
+    <<136, 0>>;
+build_ws_frame(10, Payload) when is_binary(Payload) ->
+    Len = byte_size(Payload),
+    <<138, Len, Payload/binary>>.
 
