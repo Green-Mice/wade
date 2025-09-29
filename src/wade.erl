@@ -1,8 +1,5 @@
-%% wade.erl
-%% Wade - HTTP server library using OTP supervision
 -module(wade).
 -behaviour(gen_server).
-
 -include_lib("inets/include/httpd.hrl").
 -include("wade.hrl").
 
@@ -13,21 +10,103 @@
     param/2, query/2, query/3, body/2, body/3, method/1,
     request/4
 ]).
-
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3, send_response/2]).
-
 -export([parse_query/1, parse_body/1, url_decode/2, parse_pattern/1, match_pattern/3]).
-
 %% inets callback
 -export([do/1]).
-
 -export([upgrade_to_websocket/1, websocket_loop/2, send_ws/2, close_ws/1]).
+
+%% =============================================================================
+%% Internal Network Helpers (Wrappers for inets/gen_tcp)
+%% =============================================================================
+
+%% @doc Start the HTTP server using inets.
+%%      Wraps inets:start(httpd, Config) to handle errors gracefully.
+%% @param Config The inets HTTPD configuration.
+%% @return {ok, Pid} | {error, Reason}
+start_http_server(Config) ->
+    try
+        {ok, Pid} = inets:start(httpd, Config),
+        {ok, Pid}
+    catch
+        error:Reason ->
+            {error, Reason}
+    end.
+
+%% @doc Stop the HTTP server using inets.
+%%      Wraps inets:stop(httpd, Pid) to handle errors gracefully.
+%% @param Pid The PID of the HTTP server.
+%% @return ok | {error, Reason}
+stop_http_server(Pid) ->
+    try
+        inets:stop(httpd, Pid),
+        ok
+    catch
+        error:Reason ->
+            {error, Reason}
+    end.
+
+%% @doc Send data over a TCP socket.
+%%      Wraps gen_tcp:send/2 to handle errors gracefully.
+%% @param Socket The TCP socket.
+%% @param Data The data to send (iolist or binary).
+%% @return ok | {error, Reason}
+send_tcp_data(Socket, Data) ->
+    try
+        gen_tcp:send(Socket, Data),
+        ok
+    catch
+        error:Reason ->
+            {error, Reason}
+    end.
+
+%% @doc Set options for a TCP socket.
+%%      Wraps inet:setopts/2 to handle errors gracefully.
+%% @param Socket The TCP socket.
+%% @param Opts The list of options to set.
+%% @return ok | {error, Reason}
+set_tcp_opts(Socket, Opts) ->
+    try
+        inet:setopts(Socket, Opts),
+        ok
+    catch
+        error:Reason ->
+            {error, Reason}
+    end.
+
+%% @doc Perform an HTTP request (GET, POST, etc.).
+%%      Wraps httpc:request/4 to handle errors gracefully.
+%% @param Method The HTTP method (get, post, put, etc.).
+%% @param URL The target URL.
+%% @param Headers The request headers.
+%% @param Body The request body.
+%% @return ok | {error, Reason}
+perform_http_request(Method, URL, Headers, Body) ->
+    try
+        ContentType = case lists:keyfind("content-type", 1, Headers) of
+            {_, CType} -> CType;
+            false -> "application/json"
+        end,
+        Hdrs = [{list_to_binary(K), V} || {K, V} <- Headers],
+        Verb = case Method of
+            get -> get;
+            post -> post;
+            put -> put;
+            patch -> patch;
+            delete -> delete;
+            _ -> get
+        end,
+        httpc:request(Verb, {URL, Hdrs, ContentType, Body}, [], []),
+        ok
+    catch
+        error:Reason ->
+            {error, Reason}
+    end.
 
 %% =============================================================================
 %% API
 %% =============================================================================
-
 start_link(Port) -> start_link(Port, []).
 start_link(Port, Options) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [Port, Options], []).
@@ -53,7 +132,6 @@ param(#req{params = Params, query = Query}, Key) ->
         KeyA when is_atom(KeyA) -> KeyA;
         KeyS when is_list(KeyS) -> list_to_atom(KeyS)
     end,
-    
     case proplists:get_value(KeyAtom, Params) of
         undefined -> proplists:get_value(KeyAtom, Query);
         Value -> Value
@@ -62,11 +140,9 @@ param(#req{params = Params, query = Query}, Key) ->
 %% =============================================================================
 %% gen_server callbacks
 %% =============================================================================
-
 init([Port, _Options]) ->
     process_flag(trap_exit, true),
     application:ensure_all_started(inets),
-    
     Config = [
         {port, Port},
         {server_name, "wade"},
@@ -74,8 +150,7 @@ init([Port, _Options]) ->
         {document_root, "."},
         {modules, [?MODULE]}
     ],
-    
-    case inets:start(httpd, Config) of
+    case start_http_server(Config) of
         {ok, HttpdPid} ->
             link(HttpdPid),
             io:format("Wade server started on port ~p (PID: ~p)~n", [Port, HttpdPid]),
@@ -105,7 +180,7 @@ handle_cast(_Msg, State) ->
 handle_info({'EXIT', Pid, Reason}, #state{httpd_pid = Pid} = State) ->
     io:format("HTTP server crashed (~p), restarting...~n", [Reason]),
     try
-        case inets:start(httpd, [
+        case start_http_server([
                  {port, State#state.port},
                  {server_name, "wade"},
                  {server_root, "."},
@@ -123,12 +198,11 @@ handle_info({'EXIT', Pid, Reason}, #state{httpd_pid = Pid} = State) ->
     catch
         Class:Error ->
             io:format("Exception during restart: ~p:~p~n", [Class, Error]),
-            % Optionally stop or continue with same state
             {stop, Error, State}
     end;
 
-handle_info({tcp, Socket, Data}, State) ->
-    io:format("Warning: Unexpected TCP data received: ~p~n", [Data]),
+%% Silently handle unexpected TCP data (e.g., client sends data after connection close)
+handle_info({tcp, Socket, _Data}, State) ->
     gen_tcp:close(Socket),
     {noreply, State};
 
@@ -138,7 +212,7 @@ handle_info(_Other, State) ->
 terminate(_Reason, #state{httpd_pid = HttpdPid}) ->
     case HttpdPid of
         undefined -> ok;
-        Pid -> inets:stop(httpd, Pid)
+        Pid -> stop_http_server(Pid)
     end.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -159,10 +233,8 @@ do(ModData) ->
         "options" -> options;
         _ -> unknown
     end,
-
     {Path, QueryString} = split_uri(ModData#mod.request_uri),
     Body = parse_body(ModData),
-
     Req = #req{
         method = Method,
         path = Path,
@@ -170,17 +242,15 @@ do(ModData) ->
         body = Body,
         headers = ModData#mod.parsed_header
     },
-
     Routes = gen_server:call(?MODULE, {get_routes}),
-
     case match_route(Routes, Req) of
         {ok, Handler, PathParams} ->
             ReqWithParams = Req#req{params = PathParams},
             Response = handle_request_safe(Handler, ReqWithParams, ModData),
-            send_response(Response, ModData),  % <-- send full HTTP response here
+            send_response(Response, ModData),
             {stop, normal, ModData#mod.data};
         not_found ->
-            send_response({404, "Not Found"}, ModData),  
+            send_response({404, "Not Found"}, ModData),
             {stop, normal, ModData#mod.data}
     end.
 
@@ -208,7 +278,6 @@ handle_request_safe({Handler, RequiredParams, RequiredHeaders}, Req, ModData) ->
                 Parent ! {worker_error, 500, lists:flatten(ErrorMsg)}
         end
     end),
-    
     receive
         {worker_result, Result} ->
             send_result(Result, ModData);
@@ -226,7 +295,6 @@ handle_request_safe({Handler, RequiredParams, RequiredHeaders}, Req, ModData) ->
 %% =============================================================================
 %% Route matching and utilities
 %% =============================================================================
-
 match_route([], _) -> not_found;
 match_route([#route{method = RouteMethod, pattern = Pattern, handler = Handler} | Rest], Req) ->
     MethodMatch = (RouteMethod =:= any) orelse (RouteMethod =:= Req#req.method),
@@ -263,21 +331,106 @@ send_result(Result, ModData) ->
         _ -> send_response(200, "OK", [], ModData)
     end.
 
+%% @doc Send an HTTP response over the socket.
+%%      Uses send_tcp_data/2 to handle errors gracefully.
 send_response(Status, Body, Headers, ModData) ->
     BodyStr = lists:flatten(io_lib:format("~s", [Body])),
     DefaultHeaders = [{"Content-Type", "text/html; charset=UTF-8"},
                      {"Content-Length", integer_to_list(length(BodyStr))}],
     AllHeaders = merge_headers(DefaultHeaders, Headers),
-    
     Response = [
         io_lib:format("HTTP/1.1 ~p ~s\r\n", [Status, status_text(Status)]),
         [io_lib:format("~s: ~s\r\n", [K, V]) || {K, V} <- AllHeaders],
         "\r\n", BodyStr
     ],
-    
-    gen_tcp:send(ModData#mod.socket, Response).
+    send_tcp_data(ModData#mod.socket, Response).
 
-%% Parsing utilities
+send_response({StatusCode, Body}, ModData) ->
+    BodyBin = case is_list(Body) of
+                  true -> list_to_binary(Body);
+                  false -> Body
+              end,
+    ContentLength = byte_size(BodyBin),
+    Headers = [
+        {"content-length", integer_to_list(ContentLength)},
+        {"content-type", "application/json"},
+        {"connection", "close"}
+    ],
+    HeaderLines = lists:map(fun({Key, Value}) ->
+                                io_lib:format("~s: ~s\r\n", [Key, Value])
+                            end, Headers),
+    ResponseIolist = [
+        io_lib:format("HTTP/1.1 ~p ~s\r\n", [StatusCode, status_text(StatusCode)]),
+        HeaderLines, "\r\n", BodyBin
+    ],
+    send_tcp_data(ModData#mod.socket, ResponseIolist).
+
+%% =============================================================================
+%% WebSocket Support
+%% =============================================================================
+%% Perform the WebSocket handshake and switch protocol
+upgrade_to_websocket(ModData) ->
+    Headers = ModData#mod.parsed_header,
+    case proplists:get_value("sec-websocket-key", Headers) of
+        undefined ->
+            send_tcp_data(ModData#mod.socket,
+                "HTTP/1.1 400 Bad Request\r\n\r\nMissing Sec-WebSocket-Key");
+        Key ->
+            Accept = base64:encode(crypto:hash(sha,
+                Key ++ "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")),
+            Response =
+                "HTTP/1.1 101 Switching Protocols\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Accept: " ++ Accept ++ "\r\n\r\n",
+            send_tcp_data(ModData#mod.socket, Response),
+            {ok, ModData#mod.socket}
+    end.
+
+%% Main loop – handles incoming websocket frames
+websocket_loop(Socket, HandlerFun) ->
+    set_tcp_opts(Socket, [{active, once}]),
+    receive
+        {tcp, Socket, Data} ->
+            case parse_ws_frame(Data) of
+                {text, Msg} ->
+                    HandlerFun({text, Msg}),
+                    websocket_loop(Socket, HandlerFun);
+                {close, _} ->
+                    close_ws(Socket);
+                {ping, Msg} ->
+                    send_ws(Socket, {pong, Msg}),
+                    websocket_loop(Socket, HandlerFun);
+                _ ->
+                    websocket_loop(Socket, HandlerFun)
+            end;
+        {tcp_closed, Socket} ->
+            ok
+    end.
+
+%% Send WebSocket frames
+send_ws(Socket, {text, Msg}) ->
+    Frame = build_ws_frame(1, list_to_binary(Msg)),
+    send_tcp_data(Socket, Frame);
+
+send_ws(Socket, {pong, Msg}) ->
+    Frame = build_ws_frame(10, Msg),
+    send_tcp_data(Socket, Frame).
+
+close_ws(Socket) ->
+    Frame = build_ws_frame(8, <<>>),
+    send_tcp_data(Socket, Frame),
+    gen_tcp:close(Socket).
+
+%% =============================================================================
+%% Client HTTP (GET, POST, PUT, PATCH, DELETE)
+request(Method, URL, Headers, Body) ->
+    application:ensure_all_started(inets),
+    perform_http_request(Method, URL, Headers, Body).
+
+%% =============================================================================
+%% Parsing utilities and status text
+%% =============================================================================
 split_uri(URI) ->
     case string:split(URI, "?", leading) of
         [Path] -> {Path, ""};
@@ -312,15 +465,26 @@ parse_query(Query) ->
          [K, V] -> {list_to_atom(url_decode(K)), url_decode(V)}
      end || Pair <- string:split(Query, "&", all)].
 
-%% Helper to check content type inline without calling a separate function
-is_supported_content_type(ContentType) ->
-    SupportedContentTypes = [
-        "application/json",
-        "application/x-www-form-urlencoded",
-        "text/plain",
-        "text/html"
-    ],
-    lists:any(fun(Type) -> string:find(ContentType, Type) =/= nomatch end, SupportedContentTypes).
+url_decode(Str) -> url_decode(Str, []).
+url_decode([], Acc) -> lists:reverse(Acc);
+url_decode([$%, H1, H2 | Rest], Acc) ->
+    Char = list_to_integer([H1, H2], 16),
+    url_decode(Rest, [Char | Acc]);
+url_decode([$+ | Rest], Acc) -> url_decode(Rest, [32 | Acc]);
+url_decode([C | Rest], Acc) -> url_decode(Rest, [C | Acc]).
+
+status_text(200) -> "OK";
+status_text(201) -> "Created";
+status_text(400) -> "Bad Request";
+status_text(404) -> "Not Found";
+status_text(405) -> "Method Not Allowed";
+status_text(500) -> "Internal Server Error";
+status_text(501) -> "Not Implemented";
+status_text(504) -> "Gateway Timeout";
+status_text(Code) -> integer_to_list(Code).
+
+merge_headers(Defaults, Custom) ->
+    lists:foldl(fun({K, V}, Acc) -> lists:keystore(K, 1, Acc, {K, V}) end, Defaults, Custom).
 
 binary_to_string(Binary) when is_binary(Binary) ->
     binary:bin_to_list(Binary);
@@ -330,13 +494,11 @@ binary_to_string(Other) ->
 parse_body(ModData) when is_tuple(ModData) ->
     case ModData of
         #mod{method=Method, parsed_header=Headers, entity_body=Body} ->
-            io:format("Wade: Parsing body for method ~p~n", [Method]),
             MethodUpper = string:to_upper(Method),
             IsBodyMethod = MethodUpper == "POST" orelse MethodUpper == "PUT" orelse MethodUpper == "PATCH",
             if
                 IsBodyMethod ->
                     ContentType = proplists:get_value("content-type", Headers, ""),
-                    io:format("Wade: Content-Type is ~p~n", [ContentType]),
                     case is_supported_content_type(ContentType) of
                         true ->
                             case string:find(ContentType, "application/x-www-form-urlencoded") of
@@ -354,13 +516,11 @@ parse_body(ModData) when is_tuple(ModData) ->
                     []
             end;
         {mod, Method, _RequestURI, Headers, Body, _O1, _O2} ->
-            io:format("Wade: Parsing body with raw tuple, method ~p~n", [Method]),
             MethodUpper = string:to_upper(Method),
             IsBodyMethod = MethodUpper == "POST" orelse MethodUpper == "PUT" orelse MethodUpper == "PATCH",
             if
                 IsBodyMethod ->
                     ContentType = proplists:get_value("content-type", Headers, ""),
-                    io:format("Wade: Content-Type is ~p~n", [ContentType]),
                     case is_supported_content_type(ContentType) of
                         true ->
                             case string:find(ContentType, "application/x-www-form-urlencoded") of
@@ -382,145 +542,18 @@ parse_body(ModData) when is_tuple(ModData) ->
             []
     end.
 
-url_decode(Str) -> url_decode(Str, []).
-url_decode([], Acc) -> lists:reverse(Acc);
-url_decode([$%, H1, H2 | Rest], Acc) ->
-    Char = list_to_integer([H1, H2], 16),
-    url_decode(Rest, [Char | Acc]);
-url_decode([$+ | Rest], Acc) -> url_decode(Rest, [32 | Acc]);
-url_decode([C | Rest], Acc) -> url_decode(Rest, [C | Acc]).
-
-%% Sends an HTTP response over the socket stored in ModData#mod.conn
-send_response({StatusCode, Body}, ModData) ->
-    % Build the HTTP status line: e.g. "HTTP/1.1 200 OK\r\n"
-    StatusLine = io_lib:format("HTTP/1.1 ~p ~s\r\n",
-                               [StatusCode, status_text(StatusCode)]),
-
-    % Convert body to binary if it's a list (string)
-    BodyBin = case is_list(Body) of
-                  true -> list_to_binary(Body);
-                  false -> Body
-              end,
-
-    ContentLength = byte_size(BodyBin),
-
-    % Prepare HTTP response headers
-    Headers = [
-        {"content-length", integer_to_list(ContentLength)},
-        {"content-type", "application/json"},  % Adjust content-type as appropriate
-        {"connection", "close"}
+is_supported_content_type(ContentType) ->
+    SupportedContentTypes = [
+        "application/json",
+        "application/x-www-form-urlencoded",
+        "text/plain",
+        "text/html"
     ],
-
-    % Serialize headers to HTTP header lines
-    HeaderLines = lists:map(fun({Key, Value}) ->
-                                io_lib:format("~s: ~s\r\n", [Key, Value])
-                            end, Headers),
-
-    % Compose full HTTP response iolist: status line, headers, blank line, body
-    ResponseIolist = [StatusLine, HeaderLines, "\r\n", BodyBin],
-
-    % Send the serialized response over TCP socket
-    gen_tcp:send(ModData#mod.connection, ResponseIolist).
-
-%% Maps HTTP status codes to reason phrases
-status_text(200) -> "OK";
-status_text(201) -> "Created";
-status_text(400) -> "Bad Request";
-status_text(404) -> "Not Found";
-status_text(405) -> "Method Not Allowed";
-status_text(500) -> "Internal Server Error";
-status_text(501) -> "Not Implemented";
-status_text(504) -> "Gateway Timeout";
-status_text(Code) -> integer_to_list(Code).
-
-merge_headers(Defaults, Custom) ->
-    lists:foldl(fun({K, V}, Acc) -> lists:keystore(K, 1, Acc, {K, V}) end, Defaults, Custom).
-
-%% Client HTTP (GET, POST, PUT, PATCH, DELETE)
-request(Method, URL, Headers, Body) ->
-    application:ensure_all_started(inets),
-    Verb =
-        case Method of
-            get -> get;
-            post -> post;
-            put -> put;
-            patch -> patch;
-            delete -> delete;
-            _ -> get
-        end,
-    ContentType = case lists:keyfind("content-type", 1, Headers) of
-        {_, CType} -> CType;
-        false -> "application/json"
-    end,
-    Hdrs = [{list_to_binary(K), V} || {K, V} <- Headers],
-    case Verb of
-        get -> 
-            httpc:request(get, {URL, Hdrs}, [], []);
-        _ ->
-            httpc:request(Verb, {URL, Hdrs, ContentType, Body}, [], [])
-    end.
-
-%% =============================================================================
-%% WebSocket Support
-%% =============================================================================
-
-%% Perform the WebSocket handshake and switch protocol
-upgrade_to_websocket(ModData) ->
-    Headers = ModData#mod.parsed_header,
-    case proplists:get_value("sec-websocket-key", Headers) of
-        undefined ->
-            gen_tcp:send(ModData#mod.socket,
-                "HTTP/1.1 400 Bad Request\r\n\r\nMissing Sec-WebSocket-Key");
-        Key ->
-            Accept = base64:encode(crypto:hash(sha,
-                Key ++ "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")),
-            Response =
-                "HTTP/1.1 101 Switching Protocols\r\n" ++
-                "Upgrade: websocket\r\n" ++
-                "Connection: Upgrade\r\n" ++
-                "Sec-WebSocket-Accept: " ++ Accept ++ "\r\n\r\n",
-            gen_tcp:send(ModData#mod.socket, Response),
-            {ok, ModData#mod.socket}
-    end.
-
-%% Main loop – handles incoming websocket frames
-websocket_loop(Socket, HandlerFun) ->
-    inet:setopts(Socket, [{active, once}]),
-    receive
-        {tcp, Socket, Data} ->
-            case parse_ws_frame(Data) of
-                {text, Msg} ->
-                    HandlerFun({text, Msg}),
-                    websocket_loop(Socket, HandlerFun);
-                {close, _} ->
-                    close_ws(Socket);
-                {ping, Msg} ->
-                    send_ws(Socket, {pong, Msg}),
-                    websocket_loop(Socket, HandlerFun);
-                _ ->
-                    websocket_loop(Socket, HandlerFun)
-            end;
-        {tcp_closed, Socket} ->
-            ok
-    end.
-
-%% Send WebSocket frames
-send_ws(Socket, {text, Msg}) ->
-    Frame = build_ws_frame(1, list_to_binary(Msg)),
-    gen_tcp:send(Socket, Frame);
-send_ws(Socket, {pong, Msg}) ->
-    Frame = build_ws_frame(10, Msg),
-    gen_tcp:send(Socket, Frame).
-
-close_ws(Socket) ->
-    Frame = build_ws_frame(8, <<>>),
-    gen_tcp:send(Socket, Frame),
-    gen_tcp:close(Socket).
+    lists:any(fun(Type) -> string:find(ContentType, Type) =/= nomatch end, SupportedContentTypes).
 
 %% -----------------------------------------------------------------------------
 %% Internal frame helpers
 %% -----------------------------------------------------------------------------
-
 %% Very basic WebSocket frame parser – supports single-frame text
 parse_ws_frame(<<129, Len, Rest/binary>>) when Len =< 125 ->
     <<Msg:Len/binary, _/binary>> = Rest,
@@ -533,7 +566,6 @@ parse_ws_frame(<<138, Len, Msg:Len/binary>>) ->
     {pong, Msg};
 parse_ws_frame(_) ->
     {unknown, <<>>}.
-
 
 %% Build a simple, unmasked WebSocket frame for text, close, and pong opcodes
 build_ws_frame(1, Payload) when is_binary(Payload) ->
