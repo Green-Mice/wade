@@ -120,6 +120,11 @@ handle_info({'EXIT', Pid, Reason}, #state{httpd_pid = Pid} = State) ->
             {stop, Reason2, State}
     end;
 
+handle_info({tcp, Socket, Data}, State) ->
+    io:format("Warning: Unexpected TCP data received: ~p~n", [Data]),
+    gen_tcp:close(Socket),
+    {noreply, State};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -137,26 +142,20 @@ code_change(_OldVsn, State, _Extra) ->
 %% =============================================================================
 do(ModData) ->
     MethodString = string:to_lower(ModData#mod.method),
-    io:format("Wade: Received method ~p on URI ~p~n", [MethodString, ModData#mod.request_uri]),
     Method = case MethodString of
         "get" -> get;
-        "post" -> 
-            io:format("Wade: Detected POST method~n"),
-            post;
+        "post" -> post;
         "put" -> put;
         "delete" -> delete;
         "patch" -> patch;
         "head" -> head;
         "options" -> options;
-        Other -> 
-            io:format("Wade: Unknown method ~p, converting to atom~n", [Other]),
-            list_to_atom(Other)
+        _ -> unknown
     end,
 
     {Path, QueryString} = split_uri(ModData#mod.request_uri),
 
-    Body = parse_body(ModData),
-    io:format("Wade: Parsed body: ~p~n", [Body]),
+    Body = parse_body(ModData),  % Parses body as earlier
 
     Req = #req{
         method = Method,
@@ -167,16 +166,17 @@ do(ModData) ->
     },
 
     Routes = gen_server:call(?MODULE, {get_routes}),
+
     case match_route(Routes, Req) of
         {ok, Handler, PathParams} ->
-            io:format("Wade: Route matched, calling handler~n", []),
             ReqWithParams = Req#req{params = PathParams},
-            handle_request_safe(Handler, ReqWithParams, ModData);
+            handle_request_safe(Handler, ReqWithParams, ModData),
+            {proceed, ModData#mod.data};
         not_found ->
-            io:format("Wade: No matching route found for path ~p~n", [Path]),
-            send_response(404, "Not Found", [], ModData)
-    end,
-    {proceed, ModData#mod.data}.
+            %% Send 404 not found and close socket or manage keep-alive
+            send_response(404, "Not Found", [], ModData),
+            {stop, normal, ModData#mod.data}
+    end.
 
 %% Safe request handling with process isolation
 handle_request_safe({Handler, RequiredParams, RequiredHeaders}, Req, ModData) ->
