@@ -77,7 +77,7 @@ parse_body_patch_urlencoded_test() ->
 parse_body_wrong_content_type_test() ->
     % POST with non-urlencoded content type should return empty list
     ModData = create_mod_data("POST", "/", "key=value", 
-                              [{"content-type", "application/json"}]),
+                              [{"content-type", "application/octet-stream"}]),
     ?assertEqual([], wade:parse_body(ModData)).
 
 parse_body_no_content_type_test() ->

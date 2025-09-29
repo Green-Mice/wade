@@ -298,30 +298,55 @@ parse_body(ModData) when is_tuple(ModData) ->
         {'EXIT', _} -> element(2, ModData);  % Test tuple fallback
         M -> M
     end,
-    
+
     Headers = case catch ModData#mod.parsed_header of
         {'EXIT', _} -> element(4, ModData);  % Test tuple fallback
         H -> H
     end,
-    
+
     EntityBody = case catch ModData#mod.entity_body of
         {'EXIT', _} -> element(5, ModData);  % Test tuple fallback
         E -> E
     end,
-    
+
     MethodUpper = string:to_upper(Method),
     HasBody = lists:member(MethodUpper, ["POST", "PUT", "PATCH"]),
 
     case HasBody of
         true ->
             ContentType = proplists:get_value("content-type", Headers, ""),
-            case string:find(ContentType, "application/x-www-form-urlencoded") of
-                nomatch -> [];
-                _ -> parse_query(EntityBody)
+            case ContentType of
+                "" ->
+                    % No content-type specified, return empty
+                    [];
+                _ ->
+                    case string:find(ContentType, "application/x-www-form-urlencoded") of
+                        nomatch -> 
+                            % Check if it's a known content type we want to handle
+                            case is_supported_content_type(ContentType) of
+                                true -> EntityBody;  % Return raw body for JSON, XML, etc.
+                                false -> []          % Unknown content type, return empty
+                            end;
+                        _ -> 
+                            % Form-encoded, parse as key-value pairs
+                            parse_query(EntityBody)
+                    end
             end;
         false ->
             []
     end.
+
+%% Helper to check if content type should be passed through
+is_supported_content_type(ContentType) ->
+    SupportedTypes = [
+        "application/json",
+        "application/xml",
+        "text/xml",
+        "text/plain"
+    ],
+    lists:any(fun(Type) -> 
+        string:find(ContentType, Type) =/= nomatch 
+    end, SupportedTypes).
 
 url_decode(Str) -> url_decode(Str, []).
 url_decode([], Acc) -> lists:reverse(Acc);
