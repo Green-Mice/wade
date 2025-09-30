@@ -2,10 +2,6 @@
 -behaviour(gen_server).
 -include("wade_ws_client.hrl").
 
-%% @doc WebSocket client for Wade.
-%% Provides a gen_server-based WebSocket client with SSL/TLS support.
-%% Messages are sent to the parent process that started the client.
-
 %% API
 -export([start_link/3, send_ws/2, close/1]).
 

@@ -17,9 +17,6 @@
 -export([do/1]).
 -export([upgrade_to_websocket/1, websocket_loop/2, send_ws/2, close_ws/1]).
 
-%% @doc Wade - An ultra-simple HTTP server for Erlang.
-%% Keep your socks dry with Wade, a lightweight web framework built on top of inets.
-
 %% =============================================================================
 %% Internal Network Helpers (Wrappers for inets/gen_tcp)
 %% =============================================================================
