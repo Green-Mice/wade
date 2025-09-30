@@ -565,7 +565,7 @@ match_pattern([{param, Name} | PR], [Value | PathR], Acc) ->
 match_pattern(_, _, _) -> no_match.
 
 %% @doc Parse a URL query string into a proplist.
-%% @param Query Query string like "key1=value1&key2=value2".
+%% @param Query Query string.
 %% @return [{Key, Value}] where Key is an atom and Value is a string.
 parse_query("") -> [];
 parse_query(Query) ->
