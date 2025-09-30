@@ -151,50 +151,54 @@ code_change(_OldVsn, State, _Extra) ->
 %% =============================================================================
 %% HTTP request handling (inets callback)
 %% =============================================================================
-
 do(ModData) ->
-    MethodString = string:to_lower(ModData#mod.method),
-    Method = case MethodString of
-        "get" -> get;
-        "post" -> post;
-        "put" -> put;
-        "delete" -> delete;
-        "patch" -> patch;
-        "head" -> head;
-        "options" -> options;
-        _ -> unknown
-    end,
-    
-    {Path, QueryString} = split_uri(ModData#mod.request_uri),
-    Body = parse_body(ModData),
-    
-    Req = #req{
-        method = Method,
-        path = Path,
-        query = parse_query(QueryString),
-        body = Body,
-        headers = ModData#mod.parsed_header,
-        reply_status = undefined,
-        reply_headers = #{},
-        reply_body = <<>>
-    },
-    
-    % Try dispatch-based routing first
-    Dispatch = gen_server:call(?MODULE, {get_dispatch}),
-    case match_dispatch(Dispatch, Path, Req) of
-        {ok, Response} ->
-            send_final_response(Response, ModData);
-        not_found ->
-            % Fallback to old-style routes
-            Routes = gen_server:call(?MODULE, {get_routes}),
-            case match_route(Routes, Req) of
-                {ok, Handler, PathParams} ->
-                    ReqWithParams = Req#req{params = PathParams},
-                    Response = handle_request_safe(Handler, ReqWithParams, ModData),
-                    send_final_response(Response, ModData);
-                not_found ->
-                    send_final_response({404, <<"Not Found">>}, ModData)
-            end
+    try
+        MethodString = string:to_lower(ModData#mod.method),
+        Method = case MethodString of
+            "get" -> get;
+            "post" -> post;
+            "put" -> put;
+            "delete" -> delete;
+            "patch" -> patch;
+            "head" -> head;
+            "options" -> options;
+            _ -> unknown
+        end,
+
+        {Path, QueryString} = split_uri(ModData#mod.request_uri),
+        Body = parse_body(ModData),
+
+        Req = #req{
+            method = Method,
+            path = Path,
+            query = parse_query(QueryString),
+            body = Body,
+            headers = ModData#mod.parsed_header,
+            reply_status = undefined,
+            reply_headers = #{},
+            reply_body = <<>>
+        },
+
+        Dispatch = gen_server:call(?MODULE, {get_dispatch}),
+        Response = case match_dispatch(Dispatch, Path, Req) of
+            {ok, Result} -> Result;
+            not_found ->
+                Routes = gen_server:call(?MODULE, {get_routes}),
+                case match_route(Routes, Req) of
+                    {ok, Handler, PathParams} ->
+                        ReqWithParams = Req#req{params = PathParams},
+                        handle_request_safe(Handler, ReqWithParams, ModData);
+                    not_found -> {404, <<"Not Found">>}
+                end
+        end,
+        send_final_response(Response, ModData)
+    catch
+        Class:Reason:Stacktrace ->
+            io:format("Error in do/1: ~p:~p~nStacktrace: ~p~n", [Class, Reason, Stacktrace]),
+            %% Return 500 error with JSON error body so the client sees a consistent message
+            ErrorBody = jsx:encode(#{error => <<"Internal Server Error">>}),
+            send_response_to_client(500, ErrorBody, [{"content-type","application/json"}], ModData),
+            {proceed, ModData#mod.data}
     end.
 
 %% Match dispatch-based routes
