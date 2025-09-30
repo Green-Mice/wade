@@ -2,7 +2,7 @@
 
 **Keep your socks dry.**
 
-Ultra-simple HTTP server for Erlang. One function, zero config, pure OTP.
+HTTP client-server for Erlang.
 
 ## Quick Start
 
@@ -55,13 +55,6 @@ wade:route(get, "/json", fun(_) ->
     {200, "{\"ok\": true}", [{"Content-Type", "application/json"}]}
 end, []).
 ```
-
-## Why Wade?
-
-- **Simple**: One function for everything
-- **Safe**: OTP supervision, isolated handlers  
-- **Fast**: Built on inets, minimal overhead
-- **Robust**: Crashes don't sink the ship
 
 No XML. No complex routing. No wet socks.
 
