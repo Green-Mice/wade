@@ -73,9 +73,9 @@ reply(Req, StatusCode, Headers, Body) ->
 init([Port, Options]) ->
     process_flag(trap_exit, true),
     application:ensure_all_started(inets),
-    
+
     Dispatch = maps:get(dispatch, Options, []),
-    
+
     Config = [
         {port, Port},
         {server_name, "wade"},
@@ -83,7 +83,7 @@ init([Port, Options]) ->
         {document_root, "."},
         {modules, [?MODULE]}
     ],
-    
+
     case inets:start(httpd, Config) of
         {ok, HttpdPid} ->
             link(HttpdPid),
@@ -151,8 +151,12 @@ code_change(_OldVsn, State, _Extra) ->
 %% =============================================================================
 %% HTTP request handling (inets callback)
 %% =============================================================================
+
+%% @doc Main HTTP request handler - called by inets for each incoming request
+%% This function reads the request body, parses it, matches routes, and dispatches to handlers
 do(ModData) ->
     try
+        %% Convert HTTP method to lowercase atom
         MethodString = string:to_lower(ModData#mod.method),
         Method = case MethodString of
             "get" -> get;
@@ -165,20 +169,64 @@ do(ModData) ->
             _ -> unknown
         end,
 
+        %% Split URI into path and query string
         {Path, QueryString} = split_uri(ModData#mod.request_uri),
-        Body = parse_body(ModData),
+        
+        %% FIX: Read request body from socket for POST/PUT/PATCH requests
+        %% Inets doesn't automatically read the body, so we need to do it explicitly
+        ModDataWithBody = case lists:member(Method, [post, put, patch]) of
+            true ->
+                %% Get Content-Length from headers
+                ContentLength = case proplists:get_value("content-length", ModData#mod.parsed_header) of
+                    undefined -> 0;
+                    LenStr -> 
+                        case catch list_to_integer(LenStr) of
+                            Len when is_integer(Len) -> Len;
+                            _ -> 0
+                        end
+                end,
+                
+                %% Read body from socket if it hasn't been read yet
+                BodyData = if
+                    ContentLength > 0 andalso (ModData#mod.entity_body =:= <<>> orelse 
+                                              ModData#mod.entity_body =:= []) ->
+                        %% Body hasn't been read, read it from socket
+                        io:format("Reading ~p bytes from socket...~n", [ContentLength]),
+                        case gen_tcp:recv(ModData#mod.socket, ContentLength, 5000) of
+                            {ok, Data} -> 
+                                io:format("Successfully read body: ~p~n", [Data]),
+                                Data;
+                            {error, Reason} -> 
+                                io:format("Failed to read body: ~p~n", [Reason]),
+                                <<>>
+                        end;
+                    true ->
+                        %% Body has already been read or no content
+                        ModData#mod.entity_body
+                end,
+                
+                %% Update ModData with the body
+                ModData#mod{entity_body = BodyData};
+            false ->
+                ModData
+        end,
+        
+        %% Parse the body according to content type
+        Body = parse_body(ModDataWithBody),
 
+        %% Build request record
         Req = #req{
             method = Method,
             path = Path,
             query = parse_query(QueryString),
             body = Body,
-            headers = ModData#mod.parsed_header,
+            headers = ModDataWithBody#mod.parsed_header,
             reply_status = undefined,
             reply_headers = #{},
             reply_body = <<>>
         },
 
+        %% Try dispatch-based routing first, then fall back to regular routes
         Dispatch = gen_server:call(?MODULE, {get_dispatch}),
         Response = case match_dispatch(Dispatch, Path, Req) of
             {ok, Result} -> Result;
@@ -187,26 +235,26 @@ do(ModData) ->
                 case match_route(Routes, Req) of
                     {ok, Handler, PathParams} ->
                         ReqWithParams = Req#req{params = PathParams},
-                        handle_request_safe(Handler, ReqWithParams, ModData);
+                        handle_request_safe(Handler, ReqWithParams, ModDataWithBody);
                     not_found -> {404, <<"Not Found">>}
                 end
         end,
-        send_final_response(Response, ModData)
+        send_final_response(Response, ModDataWithBody)
     catch
-        Class:Reason:Stacktrace ->
-            io:format("Error in do/1: ~p:~p~nStacktrace: ~p~n", [Class, Reason, Stacktrace]),
-            %% Return 500 error with JSON error body so the client sees a consistent message
+        Class:Error:Stacktrace ->
+            io:format("Error in do/1: ~p:~p~nStacktrace: ~p~n", [Class, Error, Stacktrace]),
+            %% Return 500 error with JSON error body
             ErrorBody = jsx:encode(#{error => <<"Internal Server Error">>}),
             send_response_to_client(500, ErrorBody, [{"content-type","application/json"}], ModData),
             {proceed, ModData#mod.data}
     end.
 
-%% Match dispatch-based routes
+%% @doc Match dispatch-based routes
 match_dispatch([], _Path, _Req) -> not_found;
 match_dispatch([{Pattern, {Module, Args}} | Rest], Path, Req) ->
     case match_dispatch_pattern(Pattern, Path) of
         {ok, PathParams} ->
-            % Call the handler module
+            %% Call the handler module
             ReqWithParams = Req#req{params = PathParams},
             case Module:start_link(Args) of
                 {ok, _Pid} ->
@@ -222,17 +270,18 @@ match_dispatch([{Pattern, {Module, Args}} | Rest], Path, Req) ->
             match_dispatch(Rest, Path, Req)
     end.
 
+%% @doc Simple pattern matching for dispatch routes
 match_dispatch_pattern(Pattern, Path) when is_list(Pattern) ->
-    % Simple pattern matching for now
     case Pattern of
         "/" ++ _ ->
-            if 
+            if
                 Pattern == Path -> {ok, []};
                 true -> no_match
             end;
         _ -> no_match
     end.
 
+%% @doc Send the final response to the client
 send_final_response(Response, ModData) ->
     case Response of
         {StatusCode, Body} when is_integer(StatusCode) ->
@@ -247,44 +296,52 @@ send_final_response(Response, ModData) ->
     end,
     {proceed, ModData#mod.data}.
 
+%% @doc Send HTTP response to client via TCP socket
 send_response_to_client(StatusCode, Body, Headers, ModData) ->
+    %% Convert body to binary
     BodyBin = case Body of
         B when is_binary(B) -> B;
         B when is_list(B) -> list_to_binary(B);
         _ -> <<>>
     end,
-    
+
     ContentLength = byte_size(BodyBin),
-    
+
+    %% Default headers
     DefaultHeaders = [
         {"content-length", integer_to_list(ContentLength)},
         {"content-type", "text/html; charset=UTF-8"},
         {"connection", "close"}
     ],
-    
+
+    %% Merge custom headers with defaults
     AllHeaders = merge_headers(DefaultHeaders, Headers),
-    
+
+    %% Format headers as HTTP header lines
     HeaderLines = lists:map(fun({Key, Value}) ->
         K = if is_binary(Key) -> binary_to_list(Key); true -> Key end,
         V = if is_binary(Value) -> binary_to_list(Value); true -> Value end,
         io_lib:format("~s: ~s\r\n", [K, V])
     end, AllHeaders),
-    
+
+    %% Build complete HTTP response
     Response = [
         io_lib:format("HTTP/1.1 ~p ~s\r\n", [StatusCode, status_text(StatusCode)]),
         HeaderLines,
         "\r\n",
         BodyBin
     ],
-    
+
     gen_tcp:send(ModData#mod.socket, Response).
 
 %% =============================================================================
 %% Route matching and utilities
 %% =============================================================================
 
+%% @doc Match request against registered routes
 match_route([], _) -> not_found;
 match_route([#route{method = RouteMethod, pattern = Pattern, handler = Handler} | Rest], Req) ->
+    %% Check if method matches (or route accepts any method)
     MethodMatch = (RouteMethod =:= any) orelse (RouteMethod =:= Req#req.method),
     case MethodMatch of
         true ->
@@ -296,6 +353,7 @@ match_route([#route{method = RouteMethod, pattern = Pattern, handler = Handler} 
         false -> match_route(Rest, Req)
     end.
 
+%% @doc Validate that all required parameters are present
 validate_params([], _) -> ok;
 validate_params([Param | Rest], Req) ->
     case {param(Req, Param), query(Req, atom_to_list(Param)), body(Req, atom_to_list(Param))} of
@@ -303,6 +361,7 @@ validate_params([Param | Rest], Req) ->
         _ -> validate_params(Rest, Req)
     end.
 
+%% @doc Validate that all required headers are present
 validate_headers([], _) -> ok;
 validate_headers([Header | Rest], Req) ->
     case proplists:get_value(Header, Req#req.headers) of
@@ -310,14 +369,18 @@ validate_headers([Header | Rest], Req) ->
         _ -> validate_headers(Rest, Req)
     end.
 
+%% @doc Execute handler in a separate process with timeout and error handling
 handle_request_safe({Handler, RequiredParams, RequiredHeaders}, Req, _ModData) ->
     Parent = self(),
     WorkerPid = spawn_link(fun() ->
         try
+            %% Validate parameters
             case validate_params(RequiredParams, Req) of
                 ok ->
+                    %% Validate headers
                     case validate_headers(RequiredHeaders, Req) of
                         ok ->
+                            %% Execute handler
                             Result = Handler(Req),
                             Parent ! {worker_result, Result};
                         {error, missing_header, Header} ->
@@ -333,6 +396,7 @@ handle_request_safe({Handler, RequiredParams, RequiredHeaders}, Req, _ModData) -
                 Parent ! {worker_error, 500, lists:flatten(ErrorMsg)}
         end
     end),
+    %% Wait for result with timeout
     receive
         {worker_result, Result} ->
             Result;
@@ -352,18 +416,19 @@ handle_request_safe({Handler, RequiredParams, RequiredHeaders}, Req, _ModData) -
 %% HTTP Client
 %% =============================================================================
 
+%% @doc Make HTTP request to external service
 request(Method, URL, Headers, Body) ->
     application:ensure_all_started(inets),
     ContentType = case lists:keyfind("content-type", 1, Headers) of
         {_, CType} -> CType;
         false -> "application/json"
     end,
-    
+
     Request = case Method of
         get -> {URL, Headers};
         _ -> {URL, Headers, ContentType, Body}
     end,
-    
+
     case httpc:request(Method, Request, [], []) of
         {ok, {{_Version, StatusCode, _ReasonPhrase}, RespHeaders, RespBody}} ->
             {ok, StatusCode, RespHeaders, RespBody};
@@ -375,6 +440,7 @@ request(Method, URL, Headers, Body) ->
 %% WebSocket Support
 %% =============================================================================
 
+%% @doc Upgrade HTTP connection to WebSocket
 upgrade_to_websocket(ModData) ->
     Headers = ModData#mod.parsed_header,
     case proplists:get_value("sec-websocket-key", Headers) of
@@ -393,6 +459,7 @@ upgrade_to_websocket(ModData) ->
             {ok, ModData#mod.socket}
     end.
 
+%% @doc WebSocket message loop
 websocket_loop(Socket, HandlerFun) ->
     inet:setopts(Socket, [{active, once}]),
     receive
@@ -413,6 +480,7 @@ websocket_loop(Socket, HandlerFun) ->
             ok
     end.
 
+%% @doc Send WebSocket message
 send_ws(Socket, {text, Msg}) ->
     Frame = build_ws_frame(1, list_to_binary(Msg)),
     gen_tcp:send(Socket, Frame);
@@ -421,6 +489,7 @@ send_ws(Socket, {pong, Msg}) ->
     Frame = build_ws_frame(10, Msg),
     gen_tcp:send(Socket, Frame).
 
+%% @doc Close WebSocket connection
 close_ws(Socket) ->
     Frame = build_ws_frame(8, <<>>),
     gen_tcp:send(Socket, Frame),
@@ -430,12 +499,14 @@ close_ws(Socket) ->
 %% Parsing utilities
 %% =============================================================================
 
+%% @doc Split URI into path and query string
 split_uri(URI) ->
     case string:split(URI, "?", leading) of
         [Path] -> {Path, ""};
         [Path, Query] -> {Path, Query}
     end.
 
+%% @doc Parse route pattern (e.g., "/users/[id]/posts" -> [{literal, "users"}, {param, id}, {literal, "posts"}])
 parse_pattern(Path) ->
     CleanPath = string:trim(Path, leading, "/"),
     case CleanPath of
@@ -446,10 +517,12 @@ parse_pattern(Path) ->
               end || Part <- string:split(CleanPath, "/", all)]
     end.
 
+%% @doc Parse path into segments
 parse_path(Path) ->
     CleanPath = string:trim(Path, leading, "/"),
     case CleanPath of "" -> []; _ -> string:split(CleanPath, "/", all) end.
 
+%% @doc Match path segments against route pattern
 match_pattern([], [], Acc) -> {ok, lists:reverse(Acc)};
 match_pattern([{literal, Expected} | PR], [Expected | PathR], Acc) ->
     match_pattern(PR, PathR, Acc);
@@ -457,6 +530,7 @@ match_pattern([{param, Name} | PR], [Value | PathR], Acc) ->
     match_pattern(PR, PathR, [{Name, Value} | Acc]);
 match_pattern(_, _, _) -> no_match.
 
+%% @doc Parse query string into proplist
 parse_query("") -> [];
 parse_query(Query) ->
     [case string:split(Pair, "=", leading) of
@@ -464,6 +538,7 @@ parse_query(Query) ->
          [K, V] -> {list_to_atom(url_decode(K)), url_decode(V)}
      end || Pair <- string:split(Query, "&", all)].
 
+%% @doc URL decode string
 url_decode(Str) -> url_decode(Str, []).
 url_decode([], Acc) -> lists:reverse(Acc);
 url_decode([$%, H1, H2 | Rest], Acc) ->
@@ -472,14 +547,16 @@ url_decode([$%, H1, H2 | Rest], Acc) ->
 url_decode([$+ | Rest], Acc) -> url_decode(Rest, [32 | Acc]);
 url_decode([C | Rest], Acc) -> url_decode(Rest, [C | Acc]).
 
+%% @doc Merge header lists, with custom headers overriding defaults
 merge_headers(Defaults, Custom) ->
-    lists:foldl(fun({K, V}, Acc) -> 
+    lists:foldl(fun({K, V}, Acc) ->
         Key = if is_binary(K) -> binary_to_list(K); true -> K end,
-        lists:keystore(Key, 1, Acc, {Key, V}) 
+        lists:keystore(Key, 1, Acc, {Key, V})
     end, Defaults, Custom).
 
+%% @doc Parse request body based on content type
 parse_body(ModData) when is_tuple(ModData) ->
-    % Extract method, headers, and body from ModData record or tuple
+    %% Extract method, headers, and body from ModData record
     {Method, Headers, Body} = case ModData of
         #mod{method=Method0, parsed_header=Headers0, entity_body=Body0} ->
             {Method0, Headers0, Body0};
@@ -495,33 +572,36 @@ parse_body(ModData) when is_tuple(ModData) ->
     if
         IsBodyMethod ->
             ContentType = proplists:get_value("content-type", Headers, ""),
-            % Normalize content type to handle parameters e.g. application/json; charset=UTF-8
+            %% Normalize content type to handle parameters (e.g., "application/json; charset=UTF-8")
             MainContentType = case string:split(ContentType, ";", leading) of
                 [Type | _] -> string:strip(Type);
                 [] -> ""
             end,
 
+            %% Convert body to string
             BodyStr = case Body of
                 B when is_binary(B) -> binary_to_list(B);
                 B when is_list(B) -> B;
                 _ -> ""
             end,
 
+            %% Parse based on content type
             case MainContentType of
                 "application/x-www-form-urlencoded" ->
                     parse_query(BodyStr);
                 "application/json" ->
-                    case catch jsx:decode(BodyStr, [return_maps]) of
-                        {'EXIT', _} -> [];  % JSON decode failed
+                    case catch jsx:decode(list_to_binary(BodyStr), [return_maps]) of
+                        {'EXIT', _} -> [];  %% JSON decode failed
                         JsonMap -> JsonMap
                     end;
                 _ ->
-                    []  % Unsupported content type returns empty list
+                    []  %% Unsupported content type returns empty list
             end;
         true ->
             []
     end.
 
+%% @doc Parse WebSocket frame
 parse_ws_frame(<<129, Len, Rest/binary>>) when Len =< 125 ->
     <<Msg:Len/binary, _/binary>> = Rest,
     {text, binary_to_list(Msg)};
@@ -534,6 +614,7 @@ parse_ws_frame(<<138, Len, Msg:Len/binary>>) ->
 parse_ws_frame(_) ->
     {unknown, <<>>}.
 
+%% @doc Build WebSocket frame
 build_ws_frame(1, Payload) when is_binary(Payload) ->
     Len = byte_size(Payload),
     <<129, Len, Payload/binary>>;
@@ -543,6 +624,7 @@ build_ws_frame(10, Payload) when is_binary(Payload) ->
     Len = byte_size(Payload),
     <<138, Len, Payload/binary>>.
 
+%% @doc Get HTTP status text for status code
 status_text(100) -> "Continue";
 status_text(101) -> "Switching Protocols";
 status_text(200) -> "OK";
@@ -562,4 +644,5 @@ status_text(503) -> "Service Unavailable";
 status_text(504) -> "Gateway Timeout";
 status_text(Code) -> integer_to_list(Code).
 
+%% @doc Placeholder for compatibility
 send_response(_, _) -> ok.
