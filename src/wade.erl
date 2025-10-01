@@ -14,7 +14,6 @@
 -include_lib("inets/include/httpd.hrl").
 -include("wade.hrl").
 
-%% @doc Public API functions for starting/stopping the server and defining routes.
 -export([
     start_link/1, start_link/2, stop/0,
     route/4, route/5,
@@ -23,26 +22,25 @@
     request/4
 ]).
 
-%% @doc gen_server callback functions.
+%% gen_server callback functions.
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3, send_response/2]).
 
-%% @doc Internal utility functions for parsing and matching.
+%% Internal utility functions for parsing and matching.
 -export([parse_query/1, parse_body/1, url_decode/2, parse_pattern/1, match_pattern/3]).
 
-%% @doc inets HTTP callback function.
+%% inets HTTP callback function.
 -export([do/1]).
 
-%% @doc WebSocket support functions.
+%% WebSocket support functions.
 -export([upgrade_to_websocket/1, websocket_loop/2, send_ws/2, close_ws/1]).
 
 %% =============================================================================
-%% @section Public API
+%% Public API
 %% =============================================================================
 
 %% @doc Start the Wade server on the specified port.
 %% @param Port The TCP port to listen on.
 %% @return {ok, pid()} | {error, term()}
-%% @example start_link(8080).
 -spec start_link(integer()) -> {ok, pid()} | {error, term()}.
 start_link(Port) -> start_link(Port, #{}).
 
@@ -51,7 +49,6 @@ start_link(Port) -> start_link(Port, #{}).
 %% @param Options Proplist of server options. Supported keys:
 %%   - dispatch: List of {PathPattern, {Module, Args}} for dispatch-based routing.
 %% @return {ok, pid()} | {error, term()}
-%% @example start_link(8080, #{dispatch => [{"api/", {my_api, []}}]}).
 -spec start_link(integer(), map()) -> {ok, pid()} | {error, term()}.
 start_link(Port, Options) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [Port, Options], []).
@@ -68,7 +65,6 @@ stop() ->
 %% @param Handler Function: Fun(#req{}) -> #req{} | {StatusCode, Body} | {StatusCode, Headers, Body}.
 %% @param RequiredParams List of atoms: Required query/body parameters.
 %% @return ok
-%% @example route(get, "/hello", fun(Req) -> reply(Req, 200, "Hello!") end, []).
 -spec route(atom(), string(), fun((#req{}) -> term()), list(atom())) -> ok.
 route(Method, Path, Handler, RequiredParams) ->
     route(Method, Path, Handler, RequiredParams, []).
@@ -80,7 +76,6 @@ route(Method, Path, Handler, RequiredParams) ->
 %% @param RequiredParams List of atoms: Required query/body parameters.
 %% @param RequiredHeaders List of strings: Required HTTP headers.
 %% @return ok
-%% @example route(post, "/api", fun handle_api/1, [user_id], ["Authorization"]).
 -spec route(atom(), string(), fun((#req{}) -> term()), list(atom()), list(string())) -> ok.
 route(Method, Path, Handler, RequiredParams, RequiredHeaders) ->
     gen_server:call(?MODULE, {add_route, Method, Path, Handler, RequiredParams, RequiredHeaders}).
@@ -89,7 +84,6 @@ route(Method, Path, Handler, RequiredParams, RequiredHeaders) ->
 %% @param Req #req{} record.
 %% @param Key Atom or string: Parameter name.
 %% @return term() | undefined
-%% @example query(Req, "id").
 -spec query(#req{}, atom() | string()) -> term() | undefined.
 query(#req{query = Query}, Key) -> proplists:get_value(Key, Query).
 
@@ -98,7 +92,6 @@ query(#req{query = Query}, Key) -> proplists:get_value(Key, Query).
 %% @param Key Atom or string: Parameter name.
 %% @param Default term(): Default value if parameter is missing.
 %% @return term()
-%% @example query(Req, "page", 1).
 -spec query(#req{}, atom() | string(), term()) -> term().
 query(#req{query = Query}, Key, Default) -> proplists:get_value(Key, Query, Default).
 
@@ -106,7 +99,6 @@ query(#req{query = Query}, Key, Default) -> proplists:get_value(Key, Query, Defa
 %% @param Req #req{} record.
 %% @param Key Atom or string: Parameter name.
 %% @return term() | undefined
-%% @example body(Req, "username").
 -spec body(#req{}, atom() | string()) -> term() | undefined.
 body(#req{body = Body}, Key) -> proplists:get_value(Key, Body).
 
@@ -115,14 +107,12 @@ body(#req{body = Body}, Key) -> proplists:get_value(Key, Body).
 %% @param Key Atom or string: Parameter name.
 %% @param Default term(): Default value if parameter is missing.
 %% @return term()
-%% @example body(Req, "email", "default@example.com").
 -spec body(#req{}, atom() | string(), term()) -> term().
 body(#req{body = Body}, Key, Default) -> proplists:get_value(Key, Body, Default).
 
 %% @doc Get the HTTP method of the request.
 %% @param Req #req{} record.
 %% @return atom(): get, post, put, delete, etc.
-%% @example method(Req).
 -spec method(#req{}) -> atom().
 method(#req{method = Method}) -> Method.
 
@@ -130,7 +120,6 @@ method(#req{method = Method}) -> Method.
 %% @param Req #req{} record.
 %% @param Key Atom or string: Parameter name.
 %% @return term() | undefined
-%% @example param(Req, "id").
 -spec param(#req{}, atom() | string()) -> term() | undefined.
 param(#req{params = Params, query = Query}, Key) ->
     KeyAtom = case Key of
@@ -147,7 +136,6 @@ param(#req{params = Params, query = Query}, Key) ->
 %% @param StatusCode integer(): HTTP status code.
 %% @param Body binary() | string(): Response body.
 %% @return #req{} with reply fields set.
-%% @example reply(Req, 200, "OK").
 -spec reply(#req{}, integer(), binary() | string()) -> #req{}.
 reply(Req, StatusCode, Body) ->
     reply(Req, StatusCode, #{}, Body).
@@ -158,7 +146,6 @@ reply(Req, StatusCode, Body) ->
 %% @param Headers map(): Additional response headers.
 %% @param Body binary() | string(): Response body.
 %% @return #req{} with reply fields set.
-%% @example reply(Req, 200, #{<<"content-type">> => <<"application/json">>}, "{\"status\":\"ok\"}").
 -spec reply(#req{}, integer(), map(), binary() | string()) -> #req{}.
 reply(Req, StatusCode, Headers, Body) ->
     Req#req{
@@ -173,7 +160,6 @@ reply(Req, StatusCode, Headers, Body) ->
 %% @param Headers list({binary(), binary()}): Request headers.
 %% @param Body binary() | string(): Request body.
 %% @return {ok, StatusCode, Headers, Body} | {error, term()}.
-%% @example request(get, "http://example.com/api", [], "").
 -spec request(atom(), string(), list({binary(), binary()}), binary() | string()) ->
     {ok, integer(), list({binary(), binary()}), binary()} | {error, term()}.
 request(Method, URL, Headers, Body) ->
@@ -194,7 +180,7 @@ request(Method, URL, Headers, Body) ->
     end.
 
 %% =============================================================================
-%% @section gen_server Callbacks
+%% gen_server Callbacks
 %% =============================================================================
 
 %% @doc Initialize the server.
@@ -295,7 +281,7 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %% =============================================================================
-%% @section HTTP Request Handling (inets callback)
+%% HTTP Request Handling (inets callback)
 %% =============================================================================
 
 %% @doc Main HTTP request handler, called by inets for each incoming request.
@@ -476,7 +462,7 @@ send_response_to_client(StatusCode, Body, Headers, ModData) ->
     gen_tcp:send(ModData#mod.socket, Response).
 
 %% =============================================================================
-%% @section Route Matching and Utilities
+%% Route Matching and Utilities
 %% =============================================================================
 
 %% @doc Match request against registered routes.
@@ -565,7 +551,7 @@ handle_request_safe({Handler, RequiredParams, RequiredHeaders}, Req, _ModData) -
     end.
 
 %% =============================================================================
-%% @section WebSocket Support
+%% WebSocket Support
 %% =============================================================================
 
 %% @doc Upgrade HTTP connection to WebSocket.
@@ -634,7 +620,7 @@ close_ws(Socket) ->
     gen_tcp:close(Socket).
 
 %% =============================================================================
-%% @section Parsing Utilities
+%% Parsing Utilities
 %% =============================================================================
 
 %% @doc Split URI into path and query string.
