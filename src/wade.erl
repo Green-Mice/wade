@@ -318,7 +318,6 @@ do(ModData) ->
             List when is_list(List) -> list_to_binary(List);
             _ -> <<>>
         end,
-        io:format("[do] Http method: ~p, Raw body (~p bytes): ~p~n", [Method, byte_size(BodyRaw), BodyRaw]),
 
         %% Parse body according to content-type and method
         ParsedBody = parse_body(ModData#mod{
