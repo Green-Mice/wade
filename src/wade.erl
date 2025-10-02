@@ -290,9 +290,14 @@ code_change(_OldVsn, State, _Extra) ->
 -spec do(#mod{}) -> {proceed, term()}.
 do(ModData) ->
     try
-        %% Convert HTTP method to lowercase atom
-        MethodString = string:to_lower(ModData#mod.method),
-        Method = case MethodString of
+        %% Extract HTTP method as lowercase atom
+        MethodStr = string:to_lower(
+            case catch ModData#mod.method of
+                {'EXIT', _} -> "unknown";
+                Val -> Val
+            end
+        ),
+        Method = case MethodStr of
             "get" -> get;
             "post" -> post;
             "put" -> put;
@@ -302,52 +307,42 @@ do(ModData) ->
             "options" -> options;
             _ -> unknown
         end,
+        io:format("[do] HTTP method: ~p~n", [Method]),
+
         %% Split URI into path and query string
-        {Path, QueryString} = split_uri(ModData#mod.request_uri),
-        %% Read request body for POST/PUT/PATCH requests
-        ModDataWithBody = case lists:member(Method, [post, put, patch]) of
-            true ->
-                ContentLength = case proplists:get_value("content-length", ModData#mod.parsed_header) of
-                    undefined -> 0;
-                    LenStr ->
-                        case catch list_to_integer(LenStr) of
-                            Len when is_integer(Len) -> Len;
-                            _ -> 0
-                        end
-                end,
-                BodyData = if
-                    ContentLength > 0 andalso (ModData#mod.entity_body =:= <<>> orelse
-                                              ModData#mod.entity_body =:= []) ->
-                        io:format("Reading ~p bytes from socket...~n", [ContentLength]),
-                        case gen_tcp:recv(ModData#mod.socket, ContentLength, 5000) of
-                            {ok, Data} ->
-                                io:format("Successfully read body: ~p~n", [Data]),
-                                Data;
-                            {error, Reason} ->
-                                io:format("Failed to read body: ~p~n", [Reason]),
-                                <<>>
-                        end;
-                    true ->
-                        ModData#mod.entity_body
-                end,
-                ModData#mod{entity_body = BodyData};
-            false ->
-                ModData
+        {Path, QueryStr} = split_uri(ModData#mod.request_uri),
+        io:format("[do] Request path: ~p, Query string: ~p~n", [Path, QueryStr]),
+
+        %% Get raw body binary safely
+        BodyRaw = case catch ModData#mod.entity_body of
+            {'EXIT', _} -> <<>>;
+            Bin when is_binary(Bin) -> Bin;
+            List when is_list(List) -> list_to_binary(List);
+            _ -> <<>>
         end,
-        %% Parse the body according to content type
-        Body = parse_body(ModDataWithBody),
-        %% Build request record
+        io:format("[do] Raw body (~p bytes): ~p~n", [byte_size(BodyRaw), BodyRaw]),
+
+        %% Parse body according to content-type and method
+        ParsedBody = parse_body(ModData#mod{
+            entity_body = BodyRaw,
+            parsed_header = ModData#mod.parsed_header,
+            method = ModData#mod.method
+        }),
+
+        %% Build internal request record
         Req = #req{
             method = Method,
             path = Path,
-            query = parse_query(QueryString),
-            body = Body,
-            headers = ModDataWithBody#mod.parsed_header,
+            query = parse_query(QueryStr),
+            body = ParsedBody,
+            headers = ModData#mod.parsed_header,
             reply_status = undefined,
             reply_headers = #{},
             reply_body = <<>>
         },
-        %% Try dispatch-based routing first, then fall back to regular routes
+        io:format("[do] Built request record: ~p~n", [Req]),
+
+        %% Dispatch request to handler
         Dispatch = gen_server:call(?MODULE, {get_dispatch}),
         Response = case match_dispatch(Dispatch, Path, Req) of
             {ok, Result} -> Result;
@@ -356,15 +351,17 @@ do(ModData) ->
                 case match_route(Routes, Req) of
                     {ok, Handler, PathParams} ->
                         ReqWithParams = Req#req{params = PathParams},
-                        handle_request_safe(Handler, ReqWithParams, ModDataWithBody);
+                        handle_request_safe(Handler, ReqWithParams, ModData);
                     not_found -> {404, <<"Not Found">>}
                 end
         end,
-        send_final_response(Response, ModDataWithBody)
+
+        %% Send HTTP response
+        send_final_response(Response, ModData)
     catch
         Class:Error:Stacktrace ->
-            io:format("Error in do/1: ~p:~p~nStacktrace: ~p~n", [Class, Error, Stacktrace]),
-            ErrorBody = jsx:encode(#{error => <<"Internal Server Error">>}),
+            io:format("[do] Exception: ~p:~p~nStacktrace: ~p~n", [Class, Error, Stacktrace]),
+            ErrorBody = jsone:encode(#{error => <<"Internal Server Error">>}),
             send_response_to_client(500, ErrorBody, [{"content-type","application/json"}], ModData),
             {proceed, ModData#mod.data}
     end.
@@ -703,47 +700,78 @@ merge_headers(Defaults, Custom) ->
         lists:keystore(Key, 1, Acc, {Key, V})
     end, Defaults, Custom).
 
-%% @doc Parse request body based on content type.
+%% @doc Parse request body based on HTTP method and content type.
+%% Supports:
+%%   - application/x-www-form-urlencoded → parsed into proplist [{atom(), string()}]
+%%   - application/json → parsed into map()
+%%   - otherwise → []
 %% @param ModData #mod{} record.
 %% @return list({atom(), string()}) | map() | [].
--spec parse_body(#mod{}) -> list({atom(), string()}) | map() | [].
+%% @doc Parse request body into a proplist regardless of input format.
+-spec parse_body(#mod{}) -> list({atom(), string()}).
 parse_body(ModData) when is_tuple(ModData) ->
-    {Method, Headers, Body} = case ModData of
-        #mod{method=Method0, parsed_header=Headers0, entity_body=Body0} ->
-            {Method0, Headers0, Body0};
-        {mod, Method0, _RequestURI, Headers0, Body0, _O1, _O2} ->
-            {Method0, Headers0, Body0};
-        _ ->
-            {"", [], ""}
-    end,
+    {Method, Headers, Body} =
+        case ModData of
+            #mod{method = M, parsed_header = H, entity_body = B} ->
+                {M, H, B};
+            {mod, M, _RequestURI, H, B, _O1, _O2} ->
+                {M, H, B};
+            _ ->
+                {"", [], ""}
+        end,
+
     MethodUpper = string:to_upper(Method),
     IsBodyMethod = lists:member(MethodUpper, ["POST", "PUT", "PATCH"]),
-    if
-        IsBodyMethod ->
-            ContentType = proplists:get_value("content-type", Headers, ""),
-            MainContentType = case string:split(ContentType, ";", leading) of
-                [Type | _] -> string:strip(Type);
+
+    if IsBodyMethod ->
+        ContentType = proplists:get_value("content-type", Headers, ""),
+        MainContentType =
+            case string:split(ContentType, ";", leading) of
+                [Type | _] -> string:trim(Type);
                 [] -> ""
             end,
-            BodyStr = case Body of
-                B when is_binary(B) -> binary_to_list(B);
-                B when is_list(B) -> B;
+
+        BodyStr =
+            case Body of
+                B1 when is_binary(B1) -> binary_to_list(B1);
+                B1 when is_list(B1) -> B1;
                 _ -> ""
             end,
-            case MainContentType of
-                "application/x-www-form-urlencoded" ->
-                    parse_query(BodyStr);
-                "application/json" ->
-                    case catch jsx:decode(list_to_binary(BodyStr), [return_maps]) of
-                        {'EXIT', _} -> [];
-                        JsonMap -> JsonMap
-                    end;
-                _ ->
-                    []
-            end;
-        true ->
-            []
+
+        case MainContentType of
+            "application/x-www-form-urlencoded" ->
+                parse_query(BodyStr);
+
+            "application/json" ->
+                try jsone:decode(list_to_binary(BodyStr)) of
+                    JsonMap when is_map(JsonMap) ->
+                        maps:fold(
+                          fun(KeyBin, Val, Acc) ->
+                              Key = list_to_atom(binary_to_list(KeyBin)),
+                              ValStr = to_str(Val),
+                              [{Key, ValStr} | Acc]
+                          end,
+                          [],
+                          JsonMap
+                        )
+                catch
+                    _:_ -> []
+                end;
+
+            _ ->
+                []
+        end;
+
+       true ->
+        []
     end.
+
+to_str(undefined) -> "undefined";
+to_str(V) when is_binary(V) -> binary_to_list(V);
+to_str(V) when is_integer(V) -> integer_to_list(V);
+to_str(V) when is_float(V) -> io_lib:format("~p", [V]);
+to_str(V) when is_list(V) -> V;
+to_str(V) -> io_lib:format("~p", [V]).
 
 %% @doc Parse WebSocket frame.
 %% @param Data binary().
