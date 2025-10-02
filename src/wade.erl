@@ -707,7 +707,6 @@ merge_headers(Defaults, Custom) ->
 %%   - otherwise → []
 %% @param ModData #mod{} record.
 %% @return list({atom(), string()}) | map() | [].
-%% @doc Parse request body into a proplist regardless of input format.
 -spec parse_body(#mod{}) -> list({atom(), string()}).
 parse_body(ModData) when is_tuple(ModData) ->
     {Method, Headers, Body} =
