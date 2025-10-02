@@ -307,11 +307,9 @@ do(ModData) ->
             "options" -> options;
             _ -> unknown
         end,
-        io:format("[do] HTTP method: ~p~n", [Method]),
 
         %% Split URI into path and query string
         {Path, QueryStr} = split_uri(ModData#mod.request_uri),
-        io:format("[do] Request path: ~p, Query string: ~p~n", [Path, QueryStr]),
 
         %% Get raw body binary safely
         BodyRaw = case catch ModData#mod.entity_body of
@@ -320,7 +318,7 @@ do(ModData) ->
             List when is_list(List) -> list_to_binary(List);
             _ -> <<>>
         end,
-        io:format("[do] Raw body (~p bytes): ~p~n", [byte_size(BodyRaw), BodyRaw]),
+        io:format("[do] Http method: ~p, Raw body (~p bytes): ~p~n", [Method, byte_size(BodyRaw), BodyRaw]),
 
         %% Parse body according to content-type and method
         ParsedBody = parse_body(ModData#mod{
@@ -340,7 +338,6 @@ do(ModData) ->
             reply_headers = #{},
             reply_body = <<>>
         },
-        io:format("[do] Built request record: ~p~n", [Req]),
 
         %% Dispatch request to handler
         Dispatch = gen_server:call(?MODULE, {get_dispatch}),
