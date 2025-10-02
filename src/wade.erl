@@ -290,82 +290,116 @@ code_change(_OldVsn, State, _Extra) ->
 -spec do(#mod{}) -> {proceed, term()}.
 do(ModData) ->
     try
-        %% Convert HTTP method to lowercase atom
+        %% --- 1. Extract HTTP method ---
         MethodString = string:to_lower(ModData#mod.method),
         Method = case MethodString of
-            "get" -> get;
-            "post" -> post;
-            "put" -> put;
+            "get"    -> get;
+            "post"   -> post;
+            "put"    -> put;
             "delete" -> delete;
-            "patch" -> patch;
-            "head" -> head;
-            "options" -> options;
-            _ -> unknown
+            "patch"  -> patch;
+            "head"   -> head;
+            "options"-> options;
+            _        -> unknown
         end,
-        %% Split URI into path and query string
+
+        %% --- 2. Split URI into path and query string ---
         {Path, QueryString} = split_uri(ModData#mod.request_uri),
-        %% Read request body for POST/PUT/PATCH requests
+
+        %% --- 3. Read and parse the request body (for POST/PUT/PATCH) ---
         ModDataWithBody = case lists:member(Method, [post, put, patch]) of
             true ->
+                %% --- 3.1. Get Content-Length from headers ---
                 ContentLength = case proplists:get_value("content-length", ModData#mod.parsed_header) of
-                    undefined -> 0;
+                    undefined ->
+                        io:format("[Wade] Warning: No Content-Length header found~n"),
+                        0;
                     LenStr ->
                         case catch list_to_integer(LenStr) of
-                            Len when is_integer(Len) -> Len;
-                            _ -> 0
+                            Len when is_integer(Len) ->
+                                io:format("[Wade] Content-Length: ~p~n", [Len]),
+                                Len;
+                            _ ->
+                                io:format("[Wade] Error: Invalid Content-Length value: ~p~n", [LenStr]),
+                                0
                         end
                 end,
+
+                %% --- 3.2. Read body from socket if Content-Length > 0 ---
                 BodyData = if
-                    ContentLength > 0 andalso (ModData#mod.entity_body =:= <<>> orelse
-                                              ModData#mod.entity_body =:= []) ->
-                        io:format("Reading ~p bytes from socket...~n", [ContentLength]),
+                    ContentLength > 0 ->
+                        io:format("[Wade] Reading ~p bytes from socket...~n", [ContentLength]),
                         case gen_tcp:recv(ModData#mod.socket, ContentLength, 5000) of
                             {ok, Data} ->
-                                io:format("Successfully read body: ~p~n", [Data]),
+                                io:format("[Wade] Successfully read body: ~p (type: ~p)~n", [Data, erlang:type(Data)]),
                                 Data;
                             {error, Reason} ->
-                                io:format("Failed to read body: ~p~n", [Reason]),
+                                io:format("[Wade] Error: Failed to read body from socket: ~p~n", [Reason]),
                                 <<>>
                         end;
                     true ->
-                        ModData#mod.entity_body
+                        io:format("[Wade] No body to read (Content-Length = 0 or missing)~n"),
+                        <<>>
                 end,
+                %% Update ModData with the raw body
                 ModData#mod{entity_body = BodyData};
             false ->
+                %% For non-body methods (GET, etc.), keep original ModData
                 ModData
         end,
-        %% Parse the body according to content type
+
+        %% --- 4. Log raw body for debugging ---
+        io:format("[Wade] Raw entity_body: ~p (type: ~p)~n",
+                  [ModDataWithBody#mod.entity_body, erlang:type(ModDataWithBody#mod.entity_body)]),
+
+        %% --- 5. Parse the body according to Content-Type ---
         Body = parse_body(ModDataWithBody),
-        %% Build request record
+        io:format("[Wade] Parsed body: ~p~n", [Body]),
+
+        %% --- 6. Build the request record ---
         Req = #req{
-            method = Method,
-            path = Path,
-            query = parse_query(QueryString),
-            body = Body,
+            method  = Method,
+            path    = Path,
+            query   = parse_query(QueryString),
+            body    = Body,
             headers = ModDataWithBody#mod.parsed_header,
-            reply_status = undefined,
+            reply_status  = undefined,
             reply_headers = #{},
-            reply_body = <<>>
+            reply_body    = <<>>
         },
-        %% Try dispatch-based routing first, then fall back to regular routes
+
+        %% --- 7. Route matching and request handling ---
         Dispatch = gen_server:call(?MODULE, {get_dispatch}),
         Response = case match_dispatch(Dispatch, Path, Req) of
-            {ok, Result} -> Result;
+            {ok, Result} ->
+                %% Dispatch-based route matched
+                Result;
             not_found ->
+                %% Try regular routes
                 Routes = gen_server:call(?MODULE, {get_routes}),
                 case match_route(Routes, Req) of
                     {ok, Handler, PathParams} ->
+                        %% Route matched, call handler with path parameters
                         ReqWithParams = Req#req{params = PathParams},
                         handle_request_safe(Handler, ReqWithParams, ModDataWithBody);
-                    not_found -> {404, <<"Not Found">>}
+                    not_found ->
+                        %% No route matched, return 404
+                        {404, <<"Not Found">>}
                 end
         end,
+
+        %% --- 8. Send the final response ---
         send_final_response(Response, ModDataWithBody)
+
     catch
+        %% --- 9. Error handling ---
         Class:Error:Stacktrace ->
-            io:format("Error in do/1: ~p:~p~nStacktrace: ~p~n", [Class, Error, Stacktrace]),
+            io:format("[Wade] Error in do/1: ~p:~p~nStacktrace: ~p~n",
+                      [Class, Error, Stacktrace]),
             ErrorBody = jsx:encode(#{error => <<"Internal Server Error">>}),
-            send_response_to_client(500, ErrorBody, [{"content-type","application/json"}], ModData),
+            send_response_to_client(500, ErrorBody,
+                                   [{"content-type", "application/json"}],
+                                   ModData),
             {proceed, ModData#mod.data}
     end.
 
