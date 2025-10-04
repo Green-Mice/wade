@@ -838,7 +838,7 @@ send_response(_, _) -> ok.
 %% @param Options Map with QUIC-specific options:
 %%   - certfile: Path to TLS certificate (required)
 %%   - keyfile: Path to TLS private key (required)
-%%   - alpn: List of ALPN protocols (default: [<<"h3">>])
+%%   - alpn: List of ALPN protocols (default: ["h3"])
 %% @return {ok, pid()} | {error, term()}
 -spec start_quic(integer(), map()) -> {ok, pid()} | {error, term()}.
 start_quic(Port, Options) ->

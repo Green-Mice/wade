@@ -38,7 +38,7 @@
     code_change/3
 ]).
 
-%% @type h3_state()
+%% h3_state()
 -record(h3_state, {
     conn_pid :: pid(),
     control_stream_id :: integer() | undefined,
