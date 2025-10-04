@@ -34,6 +34,13 @@
 %% WebSocket support functions.
 -export([upgrade_to_websocket/1, websocket_loop/2, send_ws/2, close_ws/1]).
 
+%% Additional exports for QUIC support
+-export([
+    start_quic/2,
+    start_quic/3
+]).
+
+
 %% =============================================================================
 %% Public API
 %% =============================================================================
@@ -825,4 +832,58 @@ status_text(Code) -> integer_to_list(Code).
 %% @doc Placeholder for compatibility.
 -spec send_response(term(), term()) -> ok.
 send_response(_, _) -> ok.
+
+%% @doc Start Wade server with QUIC transport (HTTP/3)
+%% @param Port The UDP port to listen on
+%% @param Options Map with QUIC-specific options:
+%%   - certfile: Path to TLS certificate (required)
+%%   - keyfile: Path to TLS private key (required)
+%%   - alpn: List of ALPN protocols (default: [<<"h3">>])
+%% @return {ok, pid()} | {error, term()}
+-spec start_quic(integer(), map()) -> {ok, pid()} | {error, term()}.
+start_quic(Port, Options) ->
+    %% Validate required options
+    case {maps:get(certfile, Options, undefined), 
+          maps:get(keyfile, Options, undefined)} of
+        {undefined, _} ->
+            {error, {missing_option, certfile}};
+        {_, undefined} ->
+            {error, {missing_option, keyfile}};
+        {CertFile, KeyFile} ->
+            %% Check if files exist
+            case {filelib:is_file(CertFile), filelib:is_file(KeyFile)} of
+                {false, _} ->
+                    {error, {file_not_found, CertFile}};
+                {_, false} ->
+                    {error, {file_not_found, KeyFile}};
+                {true, true} ->
+                    %% Start QUIC server
+                    wade_quic:start_link(Port, Options)
+            end
+    end.
+
+%% @doc Start Wade server with both HTTP/1.1 and QUIC support
+%% Starts two servers on different ports
+%% @param HTTPPort TCP port for HTTP/1.1
+%% @param QUICPort UDP port for QUIC/HTTP3
+%% @param Options Options map (must include certfile/keyfile for QUIC)
+%% @return {ok, #{http => pid(), quic => pid()}} | {error, term()}
+-spec start_quic(integer(), integer(), map()) -> 
+    {ok, #{http => pid(), quic => pid()}} | {error, term()}.
+start_quic(HTTPPort, QUICPort, Options) ->
+    %% Start HTTP/1.1 server
+    case start_link(HTTPPort, maps:remove(certfile, maps:remove(keyfile, Options))) of
+        {ok, HTTPPid} ->
+            %% Start QUIC server
+            case start_quic(QUICPort, Options) of
+                {ok, QUICPid} ->
+                    {ok, #{http => HTTPPid, quic => QUICPid}};
+                {error, Reason} ->
+                    %% Stop HTTP server if QUIC fails
+                    stop(),
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
