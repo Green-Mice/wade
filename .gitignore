@@ -1,3 +1,4 @@
+priv/key.*
 # ---> Erlang
 .rebar3
 _build
