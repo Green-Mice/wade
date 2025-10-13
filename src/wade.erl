@@ -190,19 +190,6 @@ request(Method, URL, Headers, Body) ->
 %% @doc Register an SSE (Server-Sent Events) route.
 %% Creates an endpoint that streams events to clients using the SSE protocol.
 %% The handler function receives an SSE connection and can send events asynchronously.
-%%
-%% Example:
-%% ```
-%% wade:route_sse("/events", fun(SSEConn) ->
-%%     spawn(fun() ->
-%%         timer:sleep(1000),
-%%         wade:send_sse(SSEConn, "message", "Hello from SSE!"),
-%%         wade:send_sse(SSEConn, "ping", "alive")
-%%     end),
-%%     ok
-%% end, []).
-%% ```
-%%
 %% @param Path String: URL path for the SSE endpoint.
 %% @param HandlerFun Function: fun(SSEConn) -> ok. Called when client connects.
 %% @param RequiredParams List of atoms: Required query parameters (rarely used for SSE).

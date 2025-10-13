@@ -204,13 +204,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal Functions
 %%% =============================================================================
 
-%% @doc Format an SSE event according to the spec.
-%% SSE format:
-%%   event: <type>\n
-%%   data: <line1>\n
-%%   data: <line2>\n
-%%   id: <id>\n
-%%   \n
 %% @private
 -spec format_sse_event(binary() | string() | undefined, 
                        binary() | string(), 
