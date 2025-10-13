@@ -66,6 +66,11 @@ No XML. No complex routing. No wet socks.
 
 ---
 
+# Server-Sent Events (SSE)
+
+Wade includes built-in support for Server-Sent Events (SSE) — a lightweight HTTP streaming protocol for sending real-time event updates from the server to connected clients. SSE enables one-way communication (server → client) over a persistent connection, ideal for live notifications, progress updates, and continuous data streams. With Wade’s simple API, you can register SSE routes and stream custom events in just a few lines of code, without needing complex WebSocket setups.
+
+
 # QUIC / HTTP/3
 
 Wade QUIC is a pure Erlang implementation of QUIC (RFC 9000) and HTTP/3 (RFC 9114).

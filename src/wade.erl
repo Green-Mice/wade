@@ -18,8 +18,8 @@
     start_link/1, start_link/2, stop/0,
     route/4, route/5,
     param/2, query/2, query/3, body/2, body/3, method/1,
-    reply/3, reply/4,
-    request/4
+    reply/3, reply/4, request/4,
+    route_sse/3, send_sse/2, send_sse/3, send_sse/4, close_sse/1
 ]).
 
 %% gen_server callback functions.
@@ -186,6 +186,76 @@ request(Method, URL, Headers, Body) ->
             {error, Reason}
     end.
 
+
+%% @doc Register an SSE (Server-Sent Events) route.
+%% Creates an endpoint that streams events to clients using the SSE protocol.
+%% The handler function receives an SSE connection and can send events asynchronously.
+%%
+%% Example:
+%% ```
+%% wade:route_sse("/events", fun(SSEConn) ->
+%%     spawn(fun() ->
+%%         timer:sleep(1000),
+%%         wade:send_sse(SSEConn, "message", "Hello from SSE!"),
+%%         wade:send_sse(SSEConn, "ping", "alive")
+%%     end),
+%%     ok
+%% end, []).
+%% ```
+%%
+%% @param Path String: URL path for the SSE endpoint.
+%% @param HandlerFun Function: fun(SSEConn) -> ok. Called when client connects.
+%% @param RequiredParams List of atoms: Required query parameters (rarely used for SSE).
+%% @return ok
+-spec route_sse(string(), fun((term()) -> ok), list(atom())) -> ok.
+route_sse(Path, HandlerFun, RequiredParams) ->
+    %% Create a Wade route that upgrades to SSE
+    route(get, Path, fun(Req) ->
+        %% Get socket from ModData (need to pass it through)
+        %% This is a simplified version - see full implementation below
+        SSEHandler = fun(ModData) ->
+            Socket = ModData#mod.socket,
+            {ok, _Pid} = wade_sse:start_link(Socket, HandlerFun),
+            %% Return special marker to prevent normal response
+            {sse_upgraded, ok}
+        end,
+        
+        %% Store SSE handler in request
+        Req#req{sse_handler = SSEHandler}
+    end, RequiredParams).
+
+%% @doc Send a simple SSE event with data only.
+%% @param Conn SSE connection (from handler).
+%% @param Data The event data (binary or string).
+%% @return ok
+-spec send_sse(term(), binary() | string()) -> ok.
+send_sse(Conn, Data) ->
+    wade_sse:send_event(Conn, Data).
+
+%% @doc Send a named SSE event with data.
+%% @param Conn SSE connection (from handler).
+%% @param EventType The event type/name (binary or string).
+%% @param Data The event data (binary or string).
+%% @return ok
+-spec send_sse(term(), binary() | string(), binary() | string()) -> ok.
+send_sse(Conn, EventType, Data) ->
+    wade_sse:send_event(Conn, EventType, Data).
+
+%% @doc Send a complete SSE event with type, data, and ID.
+%% @param Conn SSE connection (from handler).
+%% @param EventType The event type/name (binary or string or undefined).
+%% @param Data The event data (binary or string).
+%% @param EventId The event ID (binary or string or undefined).
+%% @return ok
+-spec send_sse(term(), binary() | string() | undefined, 
+               binary() | string(), binary() | string() | undefined) -> ok.
+send_sse(Conn, EventType, Data, EventId) ->
+    wade_sse:send_event(Conn, EventType, Data, EventId).
+
+close_sse(SSEConn) ->
+    %% Delegate implementation, or clean up resources, or call into wade_sse:close/1
+    wade_sse:close(SSEConn).
+
 %% =============================================================================
 %% gen_server Callbacks
 %% =============================================================================
@@ -292,6 +362,8 @@ code_change(_OldVsn, State, _Extra) ->
 %% =============================================================================
 
 %% @doc Main HTTP request handler, called by inets for each incoming request.
+%% Handles routing, parameter validation, and dispatching to handlers.
+%% Supports standard HTTP responses, WebSocket upgrades, and SSE connections.
 %% @param ModData #mod{} record from inets.
 %% @return {proceed, term()}.
 -spec do(#mod{}) -> {proceed, term()}.
@@ -342,25 +414,49 @@ do(ModData) ->
             headers = ModData#mod.parsed_header,
             reply_status = undefined,
             reply_headers = #{},
-            reply_body = <<>>
+            reply_body = <<>>,
+            sse_handler = undefined
         },
 
         %% Dispatch request to handler
         Dispatch = gen_server:call(?MODULE, {get_dispatch}),
         Response = case match_dispatch(Dispatch, Path, Req) of
-            {ok, Result} -> Result;
+            {ok, Result} -> 
+                Result;
             not_found ->
                 Routes = gen_server:call(?MODULE, {get_routes}),
                 case match_route(Routes, Req) of
                     {ok, Handler, PathParams} ->
                         ReqWithParams = Req#req{params = PathParams},
-                        handle_request_safe(Handler, ReqWithParams, ModData);
-                    not_found -> {404, <<"Not Found">>}
+                        Result = handle_request_safe(Handler, ReqWithParams, ModData),
+                        
+                        %% Check if this is an SSE upgrade
+                        case Result of
+                            #req{sse_handler = SSEHandlerFun} when SSEHandlerFun =/= undefined ->
+                                %% Execute SSE handler - it will take over the socket
+                                %% The handler sends SSE headers and manages the connection
+                                SSEHandlerFun(ModData),
+                                %% Return special marker to skip normal HTTP response
+                                sse_upgraded;
+                            _ ->
+                                %% Normal HTTP response
+                                Result
+                        end;
+                    not_found -> 
+                        {404, <<"Not Found">>}
                 end
         end,
 
-        %% Send HTTP response
-        send_final_response(Response, ModData)
+        %% Send HTTP response (unless SSE has taken over the connection)
+        case Response of
+            sse_upgraded -> 
+                %% SSE handler has taken control of the socket
+                %% Do not send any response, let SSE manage the connection
+                {proceed, ModData#mod.data};
+            _ ->
+                %% Normal HTTP response
+                send_final_response(Response, ModData)
+        end
     catch
         Class:Error:Stacktrace ->
             io:format("[do] Exception: ~p:~p~nStacktrace: ~p~n", [Class, Error, Stacktrace]),

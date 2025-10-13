@@ -11,7 +11,8 @@
     params = [] :: list(),      % Path parameters from route matching
     reply_status :: integer() | undefined,  % Status code for reply
     reply_headers = #{} :: map(),           % Headers for reply
-    reply_body = <<>> :: binary()           % Body for reply
+    reply_body = <<>> :: binary(),           % Body for reply
+    sse_handler = undefined :: fun() | undefined % SSE connection handler
 }).
 
 -record(route, {
