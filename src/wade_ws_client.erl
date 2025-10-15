@@ -57,8 +57,7 @@ init({Host, Port, Path}) ->
         {'EXIT', _} ->
             io:format("Warning: certifi:cacerts() failed~n"),
             system;
-        Certs when is_list(Certs) ->
-            Certs;
+        Certs when is_list(Certs) -> Certs;
         _ ->
             io:format("Warning: certifi returned unexpected value~n"),
             system
@@ -99,10 +98,9 @@ init({Host, Port, Path}) ->
                         ok ->
                             io:format("WebSocket upgrade successful to ~s:~p~s~n", [Host, Port, Path]),
                             io:format("Will send messages to parent: ~p~n", [Parent]),
-                            
-                            %% Start a dedicated receiver process
-                            RecvPid = spawn_link(fun() -> receiver_loop(Sock, Parent, <<>>) end),
-                            
+
+                            RecvPid = spawn_link(fun() -> receiver_loop(Sock, self(), <<>>) end),
+
                             {ok, #state{
                                 host = Host,
                                 port = Port,
@@ -124,7 +122,6 @@ init({Host, Port, Path}) ->
             {stop, Error}
     end.
 
-%% @doc Dedicated receiver loop - runs in its own process
 receiver_loop(Sock, Parent, Buffer) ->
     case ssl:recv(Sock, 4096, infinity) of
         {ok, Data} ->
@@ -132,6 +129,7 @@ receiver_loop(Sock, Parent, Buffer) ->
             NewBuffer = <<Buffer/binary, Data/binary>>,
             {Frames, Rest} = parse_ws_frames(NewBuffer, []),
             io:format("[wade_ws_client] Parsed ~p frames~n", [length(Frames)]),
+            %% Send frames individually to parent immediately
             lists:foreach(fun(Frame) ->
                 Type = frame_type(Frame),
                 Data2 = frame_data(Frame),
@@ -140,19 +138,19 @@ receiver_loop(Sock, Parent, Buffer) ->
             receiver_loop(Sock, Parent, Rest);
         {error, closed} ->
             io:format("[wade_ws_client] SSL CLOSED~n"),
-            Parent ! {wade_ws_client, close};
+            Parent ! {wade_ws_client, close},
+            exit(normal);
         {error, Reason} ->
             io:format("[wade_ws_client] SSL ERROR: ~p~n", [Reason]),
-            Parent ! {wade_ws_client, close}
+            Parent ! {wade_ws_client, close},
+            exit(Reason)
     end.
 
 handle_call({send_ws, Msg}, _From, State = #state{ws_established = true, socket = Sock}) ->
     Frame = build_ws_frame(1, Msg),
     case ssl:send(Sock, Frame) of
-        ok ->
-            {reply, ok, State};
-        Error ->
-            {reply, Error, State}
+        ok -> {reply, ok, State};
+        Error -> {reply, Error, State}
     end;
 
 handle_call({send_ws, _}, _From, State) ->
@@ -165,8 +163,15 @@ handle_call(close, _From, State = #state{socket = Sock}) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({'EXIT', _Pid, _Reason}, State) ->
-    {stop, receiver_crashed, State};
+handle_info({'EXIT', Pid, Reason}, State = #state{recv_pid = Pid}) ->
+    io:format("[wade_ws_client] Receiver process exited: ~p~n", [Reason]),
+    %% Notify parent about close, cleanup state, stop gracefully
+    State#state.parent ! {wade_ws_client, close},
+    {stop, normal, State};
+
+handle_info({'EXIT', _OtherPid, _Reason}, State) ->
+    %% Ignore other exits
+    {noreply, State};
 
 handle_info(Info, State) ->
     io:format("[wade_ws_client] Unknown info: ~p~n", [Info]),
@@ -199,51 +204,31 @@ build_upgrade_request(Host, Port, Path, Key) ->
 
 parse_upgrade_response(Response) ->
     case binary:match(Response, <<"HTTP/1.1 101">>) of
-        nomatch ->
-            {error, no_101_response};
-        _ ->
-            ok
+        nomatch -> {error, no_101_response};
+        _ -> ok
     end.
 
 parse_ws_frames(<<>>, Acc) ->
     {lists:reverse(Acc), <<>>};
 parse_ws_frames(Buffer, Acc) ->
     case parse_single_ws_frame(Buffer) of
-        {ok, Frame, Rest} ->
-            parse_ws_frames(Rest, [Frame | Acc]);
-        incomplete ->
-            {lists:reverse(Acc), Buffer};
-        {error, _} ->
-            {lists:reverse(Acc), <<>>}
+        {ok, Frame, Rest} -> parse_ws_frames(Rest, [Frame | Acc]);
+        incomplete -> {lists:reverse(Acc), Buffer};
+        {error, _} -> {lists:reverse(Acc), <<>>}
     end.
 
-parse_single_ws_frame(<<Fin:1, _Rsv:3, Opcode:4, Mask:1, PayloadLen:7, Rest/binary>>) ->
-    io:format("[wade_ws_client] Frame header - Fin: ~p, Opcode: ~p, Mask: ~p, PayloadLen: ~p~n", [Fin, Opcode, Mask, PayloadLen]),
+parse_single_ws_frame(<<Fin:1, _Rsv:3, Opcode:4, _Mask:1, PayloadLen:7, Rest/binary>>) ->
+    io:format("[wade_ws_client] Frame header - Fin: ~p, Opcode: ~p, Mask: ~p, PayloadLen: ~p~n", [Fin, Opcode, 1, PayloadLen]),
     case get_payload_length(PayloadLen, Rest) of
         {ok, Length, Rest2} ->
-            case Mask of
-                0 ->
-                    if
-                        byte_size(Rest2) >= Length ->
-                            <<Payload:Length/binary, Rest3/binary>> = Rest2,
-                            Frame = {Fin, Opcode, Payload},
-                            {ok, Frame, Rest3};
-                        true ->
-                            incomplete
-                    end;
-                1 ->
-                    if
-                        byte_size(Rest2) >= 4 + Length ->
-                            <<MaskKey:4/binary, MaskedPayload:Length/binary, Rest3/binary>> = Rest2,
-                            Payload = unmask_payload(MaskedPayload, MaskKey),
-                            Frame = {Fin, Opcode, Payload},
-                            {ok, Frame, Rest3};
-                        true ->
-                            incomplete
-                    end
+            if byte_size(Rest2) >= 4 + Length ->
+                <<MaskKey:4/binary, MaskedPayload:Length/binary, Rest3/binary>> = Rest2,
+                Payload = unmask_payload(MaskedPayload, MaskKey),
+                Frame = {Fin, Opcode, Payload},
+                {ok, Frame, Rest3};
+               true -> incomplete
             end;
-        incomplete ->
-            incomplete
+        incomplete -> incomplete
     end;
 parse_single_ws_frame(_) ->
     incomplete.
@@ -286,12 +271,9 @@ build_ws_frame(Opcode, Payload) when is_binary(Payload) ->
     MaskedPayload = mask_payload(Payload, MaskKey),
 
     {LenField, ExtLen} = if
-        Len < 126 ->
-            {Len, <<>>};
-        Len < 65536 ->
-            {126, <<Len:16>>};
-        true ->
-            {127, <<Len:64>>}
+        Len < 126 -> {Len, <<>>};
+        Len < 65536 -> {126, <<Len:16>>};
+        true -> {127, <<Len:64>>}
     end,
 
     <<1:1, 0:3, Opcode:4, 1:1, LenField:7, ExtLen/binary, MaskKey/binary, MaskedPayload/binary>>.
@@ -305,3 +287,4 @@ mask_payload(<<Byte, Rest/binary>>, MaskKey, Idx, Acc) ->
     MaskByte = binary:at(MaskKey, Idx rem 4),
     MaskedByte = Byte bxor MaskByte,
     mask_payload(Rest, MaskKey, Idx + 1, <<Acc/binary, MaskedByte>>).
+
