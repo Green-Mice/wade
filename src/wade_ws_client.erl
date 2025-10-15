@@ -54,11 +54,11 @@ close(Pid) ->
 %% Establishes an SSL connection and sends the WebSocket upgrade request.
 init({Host, Port, Path}) ->
     process_flag(trap_exit, true),
-    
+
     % Get the parent process that spawned us
     Parent = case get('$ancestors') of
         [P | _] when is_pid(P) -> P;
-        [P | _] when is_atom(P) -> 
+        [P | _] when is_atom(P) ->
             % If it's a registered name, get the PID
             case whereis(P) of
                 undefined -> self();
@@ -67,10 +67,10 @@ init({Host, Port, Path}) ->
         _ -> self()
     end,
     io:format("WebSocket client starting, parent PID: ~p~n", [Parent]),
-    
+
     % Ensure certifi is loaded
     application:ensure_all_started(certifi),
-    
+
     % Get CA certs
     CACerts = case catch certifi:cacerts() of
         {'EXIT', _} ->
@@ -83,7 +83,7 @@ init({Host, Port, Path}) ->
             io:format("Warning: certifi:cacerts() returned unexpected value, using system defaults~n"),
             system
     end,
-    
+
     % Build SSL options
     SSLOpts = case CACerts of
         system ->
@@ -108,14 +108,14 @@ init({Host, Port, Path}) ->
                 ]}
             ]
     end,
-    
+
     case ssl:connect(Host, Port, SSLOpts) of
         {ok, Sock} ->
             Key16 = crypto:strong_rand_bytes(16),
             Key = base64:encode(Key16),
             UpgradeReq = build_upgrade_request(Host, Port, Path, Key),
             ok = ssl:send(Sock, UpgradeReq),
-            
+
             % Wait for upgrade response
             case ssl:recv(Sock, 0, 10000) of
                 {ok, Response} ->
@@ -172,7 +172,7 @@ handle_cast(_Msg, State) ->
 handle_info({ssl, _Sock, Data}, State) ->
     NewBuffer = <<(State#state.recv_buffer)/binary, Data/binary>>,
     {Frames, Rest} = parse_ws_frames(NewBuffer, []),
-    
+
     % Send frames to parent process
     lists:foreach(fun(Frame) ->
         Type = frame_type(Frame),
@@ -181,7 +181,7 @@ handle_info({ssl, _Sock, Data}, State) ->
         io:format("Sending message to PID ~p: ~p~n", [State#state.parent, {wade_ws_client, Type, byte_size_safe(Data2)}]),
         State#state.parent ! Msg
     end, Frames),
-    
+
     ssl:setopts(State#state.socket, [{active, once}]),
     {noreply, State#state{recv_buffer = Rest}};
 
@@ -319,7 +319,7 @@ build_ws_frame(Opcode, Payload) when is_binary(Payload) ->
     Len = byte_size(Payload),
     MaskKey = crypto:strong_rand_bytes(4),
     MaskedPayload = mask_payload(Payload, MaskKey),
-    
+
     {LenField, ExtLen} = if
         Len < 126 ->
             {Len, <<>>};
@@ -328,7 +328,7 @@ build_ws_frame(Opcode, Payload) when is_binary(Payload) ->
         true ->
             {127, <<Len:64>>}
     end,
-    
+
     <<1:1, 0:3, Opcode:4, 1:1, LenField:7, ExtLen/binary, MaskKey/binary, MaskedPayload/binary>>.
 
 mask_payload(Payload, MaskKey) ->
@@ -345,3 +345,4 @@ mask_payload(<<Byte, Rest/binary>>, MaskKey, Idx, Acc) ->
 byte_size_safe(Data) when is_binary(Data) -> byte_size(Data);
 byte_size_safe(Data) when is_list(Data) -> length(Data);
 byte_size_safe(_) -> 0.
+
