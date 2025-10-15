@@ -55,6 +55,13 @@ close(Pid) ->
 init({Host, Port, Path}) ->
     process_flag(trap_exit, true),
     
+    % Get the parent process that spawned us
+    Parent = case get('$ancestors') of
+        [P | _] -> P;
+        _ -> self()
+    end,
+    io:format("WebSocket client starting, parent: ~p~n", [Parent]),
+    
     % Ensure certifi is loaded
     application:ensure_all_started(certifi),
     
@@ -110,12 +117,13 @@ init({Host, Port, Path}) ->
                         ok ->
                             ssl:setopts(Sock, [{active, once}]),
                             io:format("WebSocket upgrade successful to ~s:~p~s~n", [Host, Port, Path]),
+                            io:format("Will send messages to parent: ~p~n", [Parent]),
                             {ok, #state{
                                 host = Host,
                                 port = Port,
                                 path = Path,
                                 socket = Sock,
-                                parent = self(),
+                                parent = Parent,
                                 ws_established = true
                             }};
                         {error, Reason} ->
@@ -161,7 +169,10 @@ handle_info({ssl, _Sock, Data}, State) ->
     
     % Send frames to parent process
     lists:foreach(fun(Frame) ->
-        State#state.parent ! {wade_ws_client, frame_type(Frame), frame_data(Frame)}
+        Type = frame_type(Frame),
+        Data2 = frame_data(Frame),
+        io:format("Sending to parent ~p: {wade_ws_client, ~p, ~p}~n", [State#state.parent, Type, Data2]),
+        State#state.parent ! {wade_ws_client, Type, Data2}
     end, Frames),
     
     ssl:setopts(State#state.socket, [{active, once}]),
