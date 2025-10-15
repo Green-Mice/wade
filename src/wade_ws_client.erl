@@ -57,10 +57,16 @@ init({Host, Port, Path}) ->
     
     % Get the parent process that spawned us
     Parent = case get('$ancestors') of
-        [P | _] -> P;
+        [P | _] when is_pid(P) -> P;
+        [P | _] when is_atom(P) -> 
+            % If it's a registered name, get the PID
+            case whereis(P) of
+                undefined -> self();
+                Pid -> Pid
+            end;
         _ -> self()
     end,
-    io:format("WebSocket client starting, parent: ~p~n", [Parent]),
+    io:format("WebSocket client starting, parent PID: ~p~n", [Parent]),
     
     % Ensure certifi is loaded
     application:ensure_all_started(certifi),
@@ -171,8 +177,9 @@ handle_info({ssl, _Sock, Data}, State) ->
     lists:foreach(fun(Frame) ->
         Type = frame_type(Frame),
         Data2 = frame_data(Frame),
-        io:format("Sending to parent ~p: {wade_ws_client, ~p, ~p}~n", [State#state.parent, Type, Data2]),
-        State#state.parent ! {wade_ws_client, Type, Data2}
+        Msg = {wade_ws_client, Type, Data2},
+        io:format("Sending message to PID ~p: ~p~n", [State#state.parent, {wade_ws_client, Type, byte_size_safe(Data2)}]),
+        State#state.parent ! Msg
     end, Frames),
     
     ssl:setopts(State#state.socket, [{active, once}]),
@@ -334,3 +341,7 @@ mask_payload(<<Byte, Rest/binary>>, MaskKey, Idx, Acc) ->
     MaskedByte = Byte bxor MaskByte,
     mask_payload(Rest, MaskKey, Idx + 1, <<Acc/binary, MaskedByte>>).
 
+%% Helper for logging
+byte_size_safe(Data) when is_binary(Data) -> byte_size(Data);
+byte_size_safe(Data) when is_list(Data) -> length(Data);
+byte_size_safe(_) -> 0.
