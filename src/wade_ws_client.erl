@@ -125,10 +125,8 @@ init({Host, Port, Path}) ->
 receiver_loop(Sock, Parent, Buffer) ->
     case ssl:recv(Sock, 4096, infinity) of
         {ok, Data} ->
-            io:format("[wade_ws_client] RECEIVED DATA: ~p bytes~n", [byte_size(Data)]),
             NewBuffer = <<Buffer/binary, Data/binary>>,
             {Frames, Rest} = parse_ws_frames(NewBuffer, []),
-            io:format("[wade_ws_client] Parsed ~p frames~n", [length(Frames)]),
             %% Send frames individually to parent immediately
             lists:foreach(fun(Frame) ->
                 Type = frame_type(Frame),
@@ -137,11 +135,9 @@ receiver_loop(Sock, Parent, Buffer) ->
             end, Frames),
             receiver_loop(Sock, Parent, Rest);
         {error, closed} ->
-            io:format("[wade_ws_client] SSL CLOSED~n"),
             Parent ! {wade_ws_client, close},
             exit(normal);
         {error, Reason} ->
-            io:format("[wade_ws_client] SSL ERROR: ~p~n", [Reason]),
             Parent ! {wade_ws_client, close},
             exit(Reason)
     end.
@@ -218,7 +214,6 @@ parse_ws_frames(Buffer, Acc) ->
     end.
 
 parse_single_ws_frame(<<Fin:1, _Rsv:3, Opcode:4, _Mask:1, PayloadLen:7, Rest/binary>>) ->
-    io:format("[wade_ws_client] Frame header - Fin: ~p, Opcode: ~p, Mask: ~p, PayloadLen: ~p~n", [Fin, Opcode, 1, PayloadLen]),
     case get_payload_length(PayloadLen, Rest) of
         {ok, Length, Rest2} ->
             if byte_size(Rest2) >= 4 + Length ->
@@ -234,13 +229,10 @@ parse_single_ws_frame(_) ->
     incomplete.
 
 get_payload_length(126, <<Length:16, Rest/binary>>) ->
-    io:format("[wade_ws_client] Extended payload length (126): ~p bytes~n", [Length]),
     {ok, Length, Rest};
 get_payload_length(127, <<Length:64, Rest/binary>>) ->
-    io:format("[wade_ws_client] Extended payload length (127): ~p bytes~n", [Length]),
     {ok, Length, Rest};
 get_payload_length(Len, Rest) when Len < 126 ->
-    io:format("[wade_ws_client] Payload length: ~p bytes~n", [Len]),
     {ok, Len, Rest};
 get_payload_length(_, _) ->
     incomplete.
