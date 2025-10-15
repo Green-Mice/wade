@@ -218,6 +218,7 @@ parse_ws_frames(Buffer, Acc) ->
     end.
 
 parse_single_ws_frame(<<Fin:1, _Rsv:3, Opcode:4, Mask:1, PayloadLen:7, Rest/binary>>) ->
+    io:format("[wade_ws_client] Frame header - Fin: ~p, Opcode: ~p, Mask: ~p, PayloadLen: ~p~n", [Fin, Opcode, Mask, PayloadLen]),
     case get_payload_length(PayloadLen, Rest) of
         {ok, Length, Rest2} ->
             case Mask of
@@ -248,10 +249,13 @@ parse_single_ws_frame(_) ->
     incomplete.
 
 get_payload_length(126, <<Length:16, Rest/binary>>) ->
+    io:format("[wade_ws_client] Extended payload length (126): ~p bytes~n", [Length]),
     {ok, Length, Rest};
 get_payload_length(127, <<Length:64, Rest/binary>>) ->
+    io:format("[wade_ws_client] Extended payload length (127): ~p bytes~n", [Length]),
     {ok, Length, Rest};
 get_payload_length(Len, Rest) when Len < 126 ->
+    io:format("[wade_ws_client] Payload length: ~p bytes~n", [Len]),
     {ok, Len, Rest};
 get_payload_length(_, _) ->
     incomplete.
@@ -301,4 +305,3 @@ mask_payload(<<Byte, Rest/binary>>, MaskKey, Idx, Acc) ->
     MaskByte = binary:at(MaskKey, Idx rem 4),
     MaskedByte = Byte bxor MaskByte,
     mask_payload(Rest, MaskKey, Idx + 1, <<Acc/binary, MaskedByte>>).
-
