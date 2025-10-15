@@ -14,6 +14,7 @@
     socket,
     parent,
     recv_buffer = <<>>,
+    recv_pid = undefined,
     ws_established = false
 }).
 
@@ -21,27 +22,14 @@
 %%% API
 %%% =============================================================================
 
-%% @doc Start a WebSocket client connection.
-%% Establishes an SSL connection to the specified host and port, then performs
-%% the WebSocket upgrade handshake.
-%% @param Host The hostname or IP address (string).
-%% @param Port The port number (integer).
-%% @param Path The WebSocket path (string), e.g., "/ws".
-%% @return {ok, Pid} | {error, Reason}
 start_link(Host, Port, Path) when is_list(Host); is_integer(Port); is_list(Path) ->
     gen_server:start_link(?MODULE, {Host, Port, Path}, []).
 
-%% @doc Send a WebSocket message to the server.
-%% The message is sent as a text frame.
-%% @param Pid The client process PID.
-%% @param Msg The message to send (binary).
-%% @return ok | {error, not_connected}
+send_ws(Pid, {text, Msg}) when is_binary(Msg) ->
+    gen_server:call(Pid, {send_ws, Msg});
 send_ws(Pid, Msg) when is_binary(Msg) ->
     gen_server:call(Pid, {send_ws, Msg}).
 
-%% @doc Close the WebSocket connection gracefully.
-%% @param Pid The client process PID.
-%% @return ok
 close(Pid) ->
     gen_server:call(Pid, close).
 
@@ -49,17 +37,12 @@ close(Pid) ->
 %%% gen_server callbacks
 %%% =============================================================================
 
-%% @private
-%% @doc Initialize the WebSocket client.
-%% Establishes an SSL connection and sends the WebSocket upgrade request.
 init({Host, Port, Path}) ->
     process_flag(trap_exit, true),
 
-    % Get the parent process that spawned us
     Parent = case get('$ancestors') of
         [P | _] when is_pid(P) -> P;
         [P | _] when is_atom(P) ->
-            % If it's a registered name, get the PID
             case whereis(P) of
                 undefined -> self();
                 Pid -> Pid
@@ -68,34 +51,28 @@ init({Host, Port, Path}) ->
     end,
     io:format("WebSocket client starting, parent PID: ~p~n", [Parent]),
 
-    % Ensure certifi is loaded
     application:ensure_all_started(certifi),
 
-    % Get CA certs
     CACerts = case catch certifi:cacerts() of
         {'EXIT', _} ->
-            io:format("Warning: certifi:cacerts() failed, using system defaults~n"),
-            % Try to use system certificates as fallback
+            io:format("Warning: certifi:cacerts() failed~n"),
             system;
         Certs when is_list(Certs) ->
             Certs;
         _ ->
-            io:format("Warning: certifi:cacerts() returned unexpected value, using system defaults~n"),
+            io:format("Warning: certifi returned unexpected value~n"),
             system
     end,
 
-    % Build SSL options
     SSLOpts = case CACerts of
         system ->
-            % Use system certificates
             [
                 {active, false},
                 binary,
                 {packet, 0},
-                {verify, verify_none} % Less secure but works without certifi
+                {verify, verify_none}
             ];
         CertList ->
-            % Use certifi certificates
             [
                 {active, false},
                 binary,
@@ -116,20 +93,23 @@ init({Host, Port, Path}) ->
             UpgradeReq = build_upgrade_request(Host, Port, Path, Key),
             ok = ssl:send(Sock, UpgradeReq),
 
-            % Wait for upgrade response
             case ssl:recv(Sock, 0, 10000) of
                 {ok, Response} ->
                     case parse_upgrade_response(Response) of
                         ok ->
-                            ssl:setopts(Sock, [{active, once}]),
                             io:format("WebSocket upgrade successful to ~s:~p~s~n", [Host, Port, Path]),
                             io:format("Will send messages to parent: ~p~n", [Parent]),
+                            
+                            %% Start a dedicated receiver process
+                            RecvPid = spawn_link(fun() -> receiver_loop(Sock, Parent, <<>>) end),
+                            
                             {ok, #state{
                                 host = Host,
                                 port = Port,
                                 path = Path,
                                 socket = Sock,
                                 parent = Parent,
+                                recv_pid = RecvPid,
                                 ws_established = true
                             }};
                         {error, Reason} ->
@@ -144,8 +124,28 @@ init({Host, Port, Path}) ->
             {stop, Error}
     end.
 
-%% @private
-%% @doc Handle synchronous calls.
+%% @doc Dedicated receiver loop - runs in its own process
+receiver_loop(Sock, Parent, Buffer) ->
+    case ssl:recv(Sock, 4096, infinity) of
+        {ok, Data} ->
+            io:format("[wade_ws_client] RECEIVED DATA: ~p bytes~n", [byte_size(Data)]),
+            NewBuffer = <<Buffer/binary, Data/binary>>,
+            {Frames, Rest} = parse_ws_frames(NewBuffer, []),
+            io:format("[wade_ws_client] Parsed ~p frames~n", [length(Frames)]),
+            lists:foreach(fun(Frame) ->
+                Type = frame_type(Frame),
+                Data2 = frame_data(Frame),
+                Parent ! {wade_ws_client, Type, Data2}
+            end, Frames),
+            receiver_loop(Sock, Parent, Rest);
+        {error, closed} ->
+            io:format("[wade_ws_client] SSL CLOSED~n"),
+            Parent ! {wade_ws_client, close};
+        {error, Reason} ->
+            io:format("[wade_ws_client] SSL ERROR: ~p~n", [Reason]),
+            Parent ! {wade_ws_client, close}
+    end.
+
 handle_call({send_ws, Msg}, _From, State = #state{ws_established = true, socket = Sock}) ->
     Frame = build_ws_frame(1, Msg),
     case ssl:send(Sock, Frame) of
@@ -162,52 +162,22 @@ handle_call(close, _From, State = #state{socket = Sock}) ->
     ssl:close(Sock),
     {stop, normal, ok, State}.
 
-%% @private
-%% @doc Handle asynchronous casts.
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-%% @private
-%% @doc Handle info messages.
-handle_info({ssl, _Sock, Data}, State) ->
-    NewBuffer = <<(State#state.recv_buffer)/binary, Data/binary>>,
-    {Frames, Rest} = parse_ws_frames(NewBuffer, []),
-
-    % Send frames to parent process
-    lists:foreach(fun(Frame) ->
-        Type = frame_type(Frame),
-        Data2 = frame_data(Frame),
-        Msg = {wade_ws_client, Type, Data2},
-        io:format("Sending message to PID ~p: ~p~n", [State#state.parent, {wade_ws_client, Type, byte_size_safe(Data2)}]),
-        State#state.parent ! Msg
-    end, Frames),
-
-    ssl:setopts(State#state.socket, [{active, once}]),
-    {noreply, State#state{recv_buffer = Rest}};
-
-handle_info({ssl_closed, _Sock}, State) ->
-    State#state.parent ! {wade_ws_client, close},
-    {stop, normal, State};
-
-handle_info({ssl_error, _Sock, Reason}, State) ->
-    io:format("SSL error: ~p~n", [Reason]),
-    State#state.parent ! {wade_ws_client, close},
-    {stop, Reason, State};
+handle_info({'EXIT', _Pid, _Reason}, State) ->
+    {stop, receiver_crashed, State};
 
 handle_info(Info, State) ->
-    io:format("Unknown message received: ~p~n", [Info]),
+    io:format("[wade_ws_client] Unknown info: ~p~n", [Info]),
     {noreply, State}.
 
-%% @private
-%% @doc Clean up before termination.
 terminate(_Reason, #state{socket = Sock}) ->
     case Sock of
         undefined -> ok;
         _ -> ssl:close(Sock)
     end.
 
-%% @private
-%% @doc Handle code changes.
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
@@ -215,7 +185,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%% =============================================================================
 
-%% @doc Build the HTTP upgrade request for WebSocket.
 build_upgrade_request(Host, Port, Path, Key) ->
     ReqString = io_lib:format(
         "GET ~s HTTP/1.1\r\n" ++
@@ -228,7 +197,6 @@ build_upgrade_request(Host, Port, Path, Key) ->
         [Path, Host, Port, Key]),
     list_to_binary(ReqString).
 
-%% @doc Parse WebSocket upgrade response
 parse_upgrade_response(Response) ->
     case binary:match(Response, <<"HTTP/1.1 101">>) of
         nomatch ->
@@ -237,7 +205,6 @@ parse_upgrade_response(Response) ->
             ok
     end.
 
-%% @doc Parse WebSocket frames from buffer
 parse_ws_frames(<<>>, Acc) ->
     {lists:reverse(Acc), <<>>};
 parse_ws_frames(Buffer, Acc) ->
@@ -250,13 +217,11 @@ parse_ws_frames(Buffer, Acc) ->
             {lists:reverse(Acc), <<>>}
     end.
 
-%% @doc Parse a single WebSocket frame
 parse_single_ws_frame(<<Fin:1, _Rsv:3, Opcode:4, Mask:1, PayloadLen:7, Rest/binary>>) ->
     case get_payload_length(PayloadLen, Rest) of
         {ok, Length, Rest2} ->
             case Mask of
                 0 ->
-                    % Unmasked frame (from server)
                     if
                         byte_size(Rest2) >= Length ->
                             <<Payload:Length/binary, Rest3/binary>> = Rest2,
@@ -266,7 +231,6 @@ parse_single_ws_frame(<<Fin:1, _Rsv:3, Opcode:4, Mask:1, PayloadLen:7, Rest/bina
                             incomplete
                     end;
                 1 ->
-                    % Masked frame (from client - shouldn't happen)
                     if
                         byte_size(Rest2) >= 4 + Length ->
                             <<MaskKey:4/binary, MaskedPayload:Length/binary, Rest3/binary>> = Rest2,
@@ -309,12 +273,9 @@ frame_type({_Fin, 9, _Payload}) -> ping;
 frame_type({_Fin, 10, _Payload}) -> pong;
 frame_type(_) -> unknown.
 
-frame_data({_Fin, Opcode, Payload}) when Opcode == 1 ->
-    binary_to_list(Payload);
 frame_data({_Fin, _Opcode, Payload}) ->
     Payload.
 
-%% @doc Build WebSocket frame
 build_ws_frame(Opcode, Payload) when is_binary(Payload) ->
     Len = byte_size(Payload),
     MaskKey = crypto:strong_rand_bytes(4),
@@ -340,9 +301,4 @@ mask_payload(<<Byte, Rest/binary>>, MaskKey, Idx, Acc) ->
     MaskByte = binary:at(MaskKey, Idx rem 4),
     MaskedByte = Byte bxor MaskByte,
     mask_payload(Rest, MaskKey, Idx + 1, <<Acc/binary, MaskedByte>>).
-
-%% Helper for logging
-byte_size_safe(Data) when is_binary(Data) -> byte_size(Data);
-byte_size_safe(Data) when is_list(Data) -> length(Data);
-byte_size_safe(_) -> 0.
 
