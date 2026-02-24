@@ -337,7 +337,7 @@ method_to_atom(_)           -> get.
 parse_body_for_wade(<<>>) -> [];
 parse_body_for_wade(Body) ->
     %% Assume JSON for now
-    try jsone:decode(Body) of
+    try json:decode(Body) of
         Map when is_map(Map) ->
             maps:fold(
                 fun(K, V, Acc) ->

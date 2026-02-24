@@ -91,7 +91,7 @@ format_empty_data_test() ->
 
 format_json_data_test() ->
     %% JSON data should be preserved
-    JSON = jsone:encode(#{status => ok, count => 42}),
+    JSON = json:encode(#{status => ok, count => 42}),
     EventType = <<"metrics">>,
     EventId = <<"1">>,
     

@@ -447,7 +447,7 @@ do(ModData) ->
     catch
         Class:Error:Stacktrace ->
             io:format("[do] Exception: ~p:~p~nStacktrace: ~p~n", [Class, Error, Stacktrace]),
-            ErrorBody = jsone:encode(#{error => <<"Internal Server Error">>}),
+            ErrorBody = json:encode(#{error => <<"Internal Server Error">>}),
             send_response_to_client(500, ErrorBody, [{"content-type","application/json"}], ModData),
             {proceed, ModData#mod.data}
     end.
@@ -828,7 +828,7 @@ parse_body(ModData) when is_tuple(ModData) ->
                 parse_query(BodyStr);
 
             "application/json" ->
-                try jsone:decode(list_to_binary(BodyStr)) of
+                try json:decode(list_to_binary(BodyStr)) of
                     JsonMap when is_map(JsonMap) ->
                         maps:fold(
                           fun(KeyBin, Val, Acc) ->
